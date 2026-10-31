@@ -21,6 +21,7 @@ import peergos.shared.user.fs.ChunkHashList;
 import peergos.shared.user.fs.HashTree;
 import peergos.shared.user.fs.ResumeUploadProps;
 import peergos.shared.user.fs.RootHash;
+import peergos.shared.user.fs.Thumbnail;
 import peergos.shared.util.Pair;
 import peergos.shared.util.PathUtil;
 
@@ -35,6 +36,7 @@ import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -158,6 +160,58 @@ public class SyncTests {
     private static void syncKeepingDeletes(Path base1, Path base2, SyncState state) throws Exception {
         DirectorySync.syncDir(new LocalFileSystem(base1, crypto.hasher), new LocalFileSystem(base2, crypto.hasher), false, false,
                 null, null, state, 32, 5, Files.createTempDirectory("peergos-sync"), crypto, () -> false, DirectorySync::log);
+    }
+
+    /** Local storage that can't hold one name, as a phone's can't hold a ':' */
+    private static class OneNameUnholdable extends LocalFileSystem {
+        private final String unholdable;
+
+        OneNameUnholdable(Path root, String unholdable) {
+            super(root, crypto.hasher);
+            this.unholdable = unholdable;
+        }
+
+        private void check(Path p) throws UnrepresentableNameException {
+            if (p.getFileName().toString().equals(unholdable))
+                throw new UnrepresentableNameException("Couldn't create " + unholdable);
+        }
+
+        @Override
+        protected Path partialCopy(Path p) throws IOException {
+            check(p);
+            return super.partialCopy(p);
+        }
+
+        @Override
+        public Optional<LocalDateTime> setBytes(Path p, long fileOffset, AsyncReader data, long size, Optional<HashTree> hash,
+                                                Optional<LocalDateTime> modificationTime, Optional<Thumbnail> thumbnail,
+                                                ResumeUploadProps props, Supplier<Boolean> isCancelled,
+                                                Consumer<String> progress) throws IOException {
+            check(p);
+            return super.setBytes(p, fileOffset, data, size, hash, modificationTime, thumbnail, props, isCancelled, progress);
+        }
+    }
+
+    /** A file the local storage can't hold is skipped, and the copy started for it is given up: left recorded, it was
+     *  resumed at the start of the next pass, failed again, and stopped every pass after it. */
+    @Test
+    public void aSkippedNameIsNotResumedNextPass() throws Exception {
+        Path local = Files.createTempDirectory("peergos-sync");
+        Path remote = Files.createTempDirectory("peergos-sync");
+        Files.writeString(remote.resolve("unholdable.txt"), "skipped");
+        Files.writeString(remote.resolve("plain.txt"), "synced");
+        SyncState state = new JdbcTreeState(":memory:");
+        List<String> log = new ArrayList<>();
+        DirectorySync.syncDir(new OneNameUnholdable(local, "unholdable.txt"), new LocalFileSystem(remote, crypto.hasher), true, true,
+                null, null, state, 32, 5, Files.createTempDirectory("peergos-sync"), crypto, () -> false, log::add);
+        Assert.assertTrue(log.toString(), log.stream().anyMatch(m -> m.contains("skipped unholdable.txt")));
+        Assert.assertTrue(state.getInProgressCopies().isEmpty());
+
+        Files.writeString(remote.resolve("later.txt"), "added after");
+        DirectorySync.syncDir(new OneNameUnholdable(local, "unholdable.txt"), new LocalFileSystem(remote, crypto.hasher), true, true,
+                null, null, state, 32, 5, Files.createTempDirectory("peergos-sync"), crypto, () -> false, DirectorySync::log);
+        Assert.assertEquals("added after", Files.readString(local.resolve("later.txt")));
+        Assert.assertFalse(Files.exists(local.resolve("unholdable.txt")));
     }
 
     @Test
