@@ -21,7 +21,6 @@ import peergos.shared.user.fs.ChunkHashList;
 import peergos.shared.user.fs.HashTree;
 import peergos.shared.user.fs.ResumeUploadProps;
 import peergos.shared.user.fs.RootHash;
-import peergos.shared.user.fs.Thumbnail;
 import peergos.shared.util.Pair;
 import peergos.shared.util.PathUtil;
 
@@ -36,7 +35,6 @@ import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
-import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -162,7 +160,8 @@ public class SyncTests {
                 null, null, state, 32, 5, Files.createTempDirectory("peergos-sync"), crypto, () -> false, DirectorySync::log);
     }
 
-    /** Local storage that can't hold one name, as a phone's can't hold a ':' */
+    /** Local storage that can't hold one name, as a phone's can't hold a ':'. It finds out once the copy is staged,
+     *  when the file is created under its name, so there is a staged copy to clean up. */
     private static class OneNameUnholdable extends LocalFileSystem {
         private final String unholdable;
 
@@ -171,24 +170,11 @@ public class SyncTests {
             this.unholdable = unholdable;
         }
 
-        private void check(Path p) throws UnrepresentableNameException {
+        @Override
+        protected void completeCopy(Path p, List<Pair<Long, Long>> ranges, long size) throws IOException {
             if (p.getFileName().toString().equals(unholdable))
                 throw new UnrepresentableNameException("Couldn't create " + unholdable);
-        }
-
-        @Override
-        protected Path partialCopy(Path p) throws IOException {
-            check(p);
-            return super.partialCopy(p);
-        }
-
-        @Override
-        public Optional<LocalDateTime> setBytes(Path p, long fileOffset, AsyncReader data, long size, Optional<HashTree> hash,
-                                                Optional<LocalDateTime> modificationTime, Optional<Thumbnail> thumbnail,
-                                                ResumeUploadProps props, Supplier<Boolean> isCancelled,
-                                                Consumer<String> progress) throws IOException {
-            check(p);
-            return super.setBytes(p, fileOffset, data, size, hash, modificationTime, thumbnail, props, isCancelled, progress);
+            super.completeCopy(p, ranges, size);
         }
     }
 
@@ -206,6 +192,11 @@ public class SyncTests {
                 null, null, state, 32, 5, Files.createTempDirectory("peergos-sync"), crypto, () -> false, log::add);
         Assert.assertTrue(log.toString(), log.stream().anyMatch(m -> m.contains("skipped unholdable.txt")));
         Assert.assertTrue(state.getInProgressCopies().isEmpty());
+        Path staging = local.resolve(LocalFileSystem.PARTIAL_COPIES_DIR);
+        if (Files.isDirectory(staging))
+            try (Stream<Path> staged = Files.list(staging)) {
+                Assert.assertEquals("the staged copy is thrown away", 0, staged.count());
+            }
 
         Files.writeString(remote.resolve("later.txt"), "added after");
         DirectorySync.syncDir(new OneNameUnholdable(local, "unholdable.txt"), new LocalFileSystem(remote, crypto.hasher), true, true,
