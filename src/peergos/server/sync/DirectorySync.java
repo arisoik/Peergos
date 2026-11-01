@@ -469,6 +469,9 @@ public class DirectorySync {
             } catch (ConcurrentChangeException e) {
                 LOG.accept("Sync: abandoning an interrupted " + (first.isLocalTarget ? "download" : "upload") + " of " +
                         first.sourceState.relPath + ", as it has changed since");
+            } catch (UnrepresentableNameException e) {
+                LOG.accept("Sync: abandoning an interrupted " + (first.isLocalTarget ? "download" : "upload") + " of " +
+                        first.sourceState.relPath + ": " + e.getMessage());
             } catch (Exception e) {
                 Throwable cause = Exceptions.getRootCause(e);
                 if (! (cause instanceof FileNotFoundException))

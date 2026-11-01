@@ -205,6 +205,34 @@ public class SyncTests {
         Assert.assertFalse(Files.exists(local.resolve("unholdable.txt")));
     }
 
+    /** A copy left recorded by a pass that stopped part way through it, for a name the storage turns out not to hold,
+     *  is given up when the next pass resumes it, and that pass carries on. */
+    @Test
+    public void anInterruptedCopyOfAnUnholdableNameIsGivenUp() throws Exception {
+        Path local = Files.createTempDirectory("peergos-sync");
+        Path remote = Files.createTempDirectory("peergos-sync");
+        Files.writeString(remote.resolve("unholdable.txt"), "skipped");
+        SyncState state = new JdbcTreeState(":memory:");
+        LocalFileSystem stopping = new LocalFileSystem(local, crypto.hasher) {
+            @Override
+            protected void completeCopy(Path p, List<Pair<Long, Long>> ranges, long size) {
+                throw new IllegalStateException("stopped");
+            }
+        };
+        try {
+            DirectorySync.syncDir(stopping, new LocalFileSystem(remote, crypto.hasher), true, true,
+                    null, null, state, 32, 5, Files.createTempDirectory("peergos-sync"), crypto, () -> false, DirectorySync::log);
+            Assert.fail("the pass should have stopped");
+        } catch (Exception expected) {}
+        Assert.assertFalse(state.getInProgressCopies().isEmpty());
+
+        Files.writeString(remote.resolve("later.txt"), "added after");
+        DirectorySync.syncDir(new OneNameUnholdable(local, "unholdable.txt"), new LocalFileSystem(remote, crypto.hasher), true, true,
+                null, null, state, 32, 5, Files.createTempDirectory("peergos-sync"), crypto, () -> false, DirectorySync::log);
+        Assert.assertEquals("added after", Files.readString(local.resolve("later.txt")));
+        Assert.assertTrue(state.getInProgressCopies().isEmpty());
+    }
+
     @Test
     public void ignoredDeletesAreOnlyLoggedOnce() throws Exception {
         Path base1 = Files.createTempDirectory("peergos-sync");
