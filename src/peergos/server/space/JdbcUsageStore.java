@@ -282,8 +282,8 @@ public class JdbcUsageStore implements UsageStore {
 
     @Override
     public void removeOwnedKey(PublicKeyHash parent, PublicKeyHash owned) {
+        // nothing to do for a writer that has gone already, as a new one does with all its edges
         try (Connection conn = getConnection(true, false);
-             // nothing to do for a writer that has gone already, as a new one does with all its edges
              PreparedStatement deleteOwned = conn.prepareStatement("DELETE FROM ownedkeys WHERE "
                      + "parent_id = (SELECT id FROM writers WHERE key_hash = ?) AND owned_id = (SELECT id FROM writers WHERE key_hash = ?);")) {
             deleteOwned.setBytes(1, parent.toBytes());
@@ -531,6 +531,8 @@ public class JdbcUsageStore implements UsageStore {
             throw new RuntimeException(sqe);
         }
         notifyWriterQuotaChanged(writer, Optional.empty());
+        // its edges went with it, and so do its bytes in flight under the caps above it
+        ownedKeysChanged(writer);
     }
 
     @Override

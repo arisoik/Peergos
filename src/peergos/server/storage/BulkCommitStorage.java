@@ -85,6 +85,7 @@ public class BulkCommitStorage extends DelegatingStorage {
                                 .thenCompose(x -> verify(owner, commit, hashes, updates))
                                 .thenCompose(inCall -> {
                                     List<Runnable> undo = registerNewWriters(owner, commit, updates, inCall);
+                                    boolean[] landed = {false};
                                     // from a future, as a refusal is thrown before the transaction's future exists
                                     return Futures.of(true).thenCompose(x -> withTransaction(owner, commit.tid, commit.hasPointerUpdate(),
                                             // the transaction has to outlive the pointer update, or the blocks
@@ -94,14 +95,23 @@ public class BulkCommitStorage extends DelegatingStorage {
                                                         List<SignedPointerUpdate> signed = commit.writers.stream()
                                                                 .flatMap(w -> w.pointer.stream())
                                                                 .collect(Collectors.toList());
-                                                        if (signed.isEmpty())
+                                                        if (signed.isEmpty()) {
+                                                            landed[0] = true;
                                                             return Futures.of(written);
+                                                        }
                                                         return pointers.setPointers(owner, signed)
-                                                                .thenApply(b -> written);
+                                                                .thenApply(set -> {
+                                                                    // the pointers moved after they were checked and none was set: the
+                                                                    // commit didn't land, and saying it did would lose it
+                                                                    if (! set)
+                                                                        throw new IllegalStateException("Pointers changed since this commit was checked; nothing was applied");
+                                                                    landed[0] = true;
+                                                                    return written;
+                                                                });
                                                     })))
-                                            // a refused commit takes back the writers it registered
+                                            // a commit refused before its pointers landed takes back the writers it registered
                                             .whenComplete((written, refused) -> {
-                                                if (refused != null)
+                                                if (refused != null && ! landed[0])
                                                     undo.forEach(Runnable::run);
                                             });
                                 })));

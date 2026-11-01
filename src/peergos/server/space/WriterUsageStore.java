@@ -15,7 +15,8 @@ public interface WriterUsageStore {
         default void writerQuotaChanged(PublicKeyHash writer, Optional<Long> quota) {}
     }
 
-    /** The listener is called after each successful updateWriterUsageAtomically, and each change to a writer quota */
+    /** The listener is called after each successful updateWriterUsageAtomically, each change to a writer quota, and
+     *  each edge added or removed and writer removed outside those */
     void addUsageListener(UsageListener listener);
 
     void addWriter(String owner, PublicKeyHash writer);

@@ -260,6 +260,10 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
         String owner = usageStore.getOwner(event.writer);
         for (PublicKeyHash owned : updatedOwned) {
             usageStore.addWriter(owner, owned);
+            // linked now rather than when the queue gets to it, so a child's first writes already count under its
+            // parent's caps; another user's writer stays theirs
+            if (owner.equals(usageStore.getOwner(owned)))
+                usageStore.addOwnedKey(event.writer, owned);
         }
     }
 
@@ -620,7 +624,8 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
             long change = changes.values().stream().mapToLong(x -> x).sum();
             long quota = getQuota(username, quotaAdmin);
             UserUsage usage = getUsage(username, usageStore);
-            if (usage.totalUsage() + change > quota)
+            // against what is committed and what other writes have reserved, or two at once could both fit
+            if (usage.expectedUsage() + change > quota)
                 throw e;
             // a commit that shrinks a capped space is allowed, even if it is still over its cap afterwards. It is judged
             // by everything the commit does under the cap, as a rotation grows one writer by what it frees in another
@@ -632,7 +637,7 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
                         .filter(c -> c.getKey().equals(cap) || writerQuotas.getCaps(c.getKey()).contains(cap))
                         .mapToLong(Map.Entry::getValue)
                         .sum();
-                if (capChange > 0 && writerQuotas.getUsage(cap).totalUsage() + capChange > capQuota.get())
+                if (capChange > 0 && writerQuotas.getUsage(cap).expectedUsage() + capChange > capQuota.get())
                     throw e;
             }
             LOG.info("Allowing a commit for " + username + " over quota: it frees " + (-change) + " bytes");
@@ -657,6 +662,7 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
         Runnable nothing = () -> {};
         Object lock = healLocks.computeIfAbsent(owner, o -> new Object());
         synchronized (lock) {
+            boolean writerAdded = false;
             try {
                 String username = core.getUsername(owner).join();
                 if (! quotaAdmin.getLocalUsernames().contains(username))
@@ -676,7 +682,6 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
                 if (! username.equals(parentUser))
                     return nothing;
                 String writerUser;
-                boolean writerAdded = false;
                 try {
                     writerUser = usageStore.getOwner(writer);
                 } catch (IllegalStateException absent) {
@@ -691,16 +696,40 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
                 boolean edgeAdded = usageStore.addOwnedKey(parent, writer);
                 boolean newWriter = writerAdded;
                 return () -> {
-                    if (newWriter)
-                        usageStore.removeWriter(writer);
-                    else if (edgeAdded)
-                        usageStore.removeOwnedKey(parent, writer);
+                    try {
+                        if (newWriter)
+                            forgetWriter(username, writer);
+                        else if (edgeAdded)
+                            usageStore.removeOwnedKey(parent, writer);
+                    } catch (Exception e) {
+                        LOG.log(Level.WARNING, "Couldn't take back new writer " + writer + " of owner " + owner, e);
+                    }
                 };
             } catch (Exception e) {
                 LOG.log(Level.WARNING, "Couldn't register new writer " + writer + " of owner " + owner, e);
+                // nothing half done stays: a writer added here without its edge would write under no cap
+                if (writerAdded) {
+                    try {
+                        usageStore.removeWriter(writer);
+                    } catch (Exception f) {
+                        LOG.log(Level.WARNING, "Couldn't take back new writer " + writer + " of owner " + owner, f);
+                    }
+                }
                 return nothing;
             }
         }
+    }
+
+    /** Forget a writer a refused commit registered, with its bytes in flight, and any writer registered under it
+     *  meanwhile: with nothing above them they would write under no cap. */
+    private void forgetWriter(String username, PublicKeyHash writer) {
+        WriterUsage registered = usageStore.getUsage(writer);
+        Set<PublicKeyHash> children = registered == null ? Set.of() : registered.ownedKeys();
+        getUsage(username, usageStore).clearPending(writer);
+        usageStore.removeWriter(writer);
+        for (PublicKeyHash child : children)
+            if (usageStore.getParents(child).isEmpty())
+                forgetWriter(username, child);
     }
 
     /** A write was attempted with a writer that is absent from the usage store. If the writer is reachable through
