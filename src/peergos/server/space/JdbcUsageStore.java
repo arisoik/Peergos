@@ -529,8 +529,12 @@ public class JdbcUsageStore implements UsageStore {
             LOG.log(Level.WARNING, sqe.getMessage(), sqe);
             throw new RuntimeException(sqe);
         }
-        // after the deletes, or a lookup in between caches the owner again and the writer outlives its removal
-        owners.remove(writer);
+        // After the deletes, and counted, so a lookup that read the owner before them doesn't cache it (getOwner).
+        // Cached, the writer would outlive its removal.
+        synchronized (owners) {
+            ownerRemovals++;
+            owners.remove(writer);
+        }
         notifyWriterQuotaChanged(writer, Optional.empty());
         // its edges went with it, and so do its bytes in flight under the caps above it
         ownedKeysChanged(writer);
@@ -591,12 +595,17 @@ public class JdbcUsageStore implements UsageStore {
     }
 
     private final Map<PublicKeyHash, String> owners = Collections.synchronizedMap(new LRUCache<>(100));
+    private long ownerRemovals = 0; // guarded by owners
 
     @Override
     public String getOwner(PublicKeyHash writer) {
         String cached = owners.get(writer);
         if (cached != null)
             return cached;
+        long removalsBefore;
+        synchronized (owners) {
+            removalsBefore = ownerRemovals;
+        }
         try (Connection conn = getConnection();
              PreparedStatement search = conn.prepareStatement("SELECT u.name FROM users u, writerusage wu WHERE u.id = wu.user_id AND wu.writer_id = ?;")) {
             int writerId = getWriterId(writer, conn);
@@ -605,7 +614,11 @@ public class JdbcUsageStore implements UsageStore {
             if (! resultSet.next())
                 throw new IllegalStateException("Unknown writer on this server!");
             String owner = resultSet.getString(1);
-            owners.put(writer, owner);
+            synchronized (owners) {
+                // a writer removed since the read may be the one read
+                if (ownerRemovals == removalsBefore)
+                    owners.put(writer, owner);
+            }
             return owner;
         } catch (SQLException sqe) {
             LOG.log(Level.WARNING, sqe.getMessage(), sqe);

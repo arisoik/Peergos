@@ -2,6 +2,7 @@ package peergos.server.tests;
 
 import org.junit.*;
 import peergos.server.*;
+import peergos.server.space.SpaceCheckingKeyFilter;
 import peergos.server.util.*;
 import peergos.shared.*;
 import peergos.shared.cbor.*;
@@ -349,6 +350,121 @@ public class WriterQuotaTests {
 
         sharee.setWriteShareQuota(mine, Optional.of(1L)).join();
         upload(owner, dir, "ownersfile", 10 * KiB);
+    }
+
+    /** The server's quota filter, to take a commit's steps one at a time */
+    private static SpaceCheckingKeyFilter quotaFilter() throws Exception {
+        java.lang.reflect.Field local = ProxyingSpaceUsage.class.getDeclaredField("local");
+        local.setAccessible(true);
+        return (SpaceCheckingKeyFilter) local.get(service.usage);
+    }
+
+    /** About 1 MiB into a writer's own space, in one buffered commit */
+    private void fillWriter(PublicKeyHash owner, SigningPrivateKeyAndPublicHash writer) {
+        NetworkAccess net = network.clear();
+        List<byte[]> blocks = new ArrayList<>();
+        for (int i = 0; i < 11; i++) {
+            byte[] block = new byte[90 * KiB];
+            random.nextBytes(block);
+            blocks.add(block);
+        }
+        net.synchronizer.applyComplexUpdate(owner, writer, (s, committer) -> IpfsTransaction.call(owner,
+                tid -> signed(writer, blocks).thenCompose(sigs -> net.dhtClient.putRaw(owner,
+                                writer.publicKeyHash, sigs, blocks, tid, x -> {}))
+                        .thenCompose(raw -> {
+                            byte[] links = new CborObject.CborList(raw.stream().map(CborObject.CborMerkleLink::new).toList()).serialize();
+                            return signed(writer, List.of(links)).thenCompose(sigs -> net.dhtClient.put(owner,
+                                    writer.publicKeyHash, sigs, List.of(links), tid));
+                        })
+                        .thenCompose(links -> {
+                            CommittedWriterData current = s.get(writer);
+                            return committer.commit(owner, writer, current.props.get().withChamp(links.get(0)), current, tid);
+                        }),
+                net.dhtClient)).join();
+    }
+
+    @Test
+    public void aRefusedCommitLeavesAWriterAnotherCommitLanded() throws Exception {
+        UserContext owner = signUp();
+        UserContext sharee = signUp();
+        PeergosNetworkUtils.friendBetweenGroups(List.of(owner), List.of(sharee));
+        Path dir = sharedDir(owner, "team", sharee);
+        owner.setWriteShareQuota(dir, Optional.of(256L * KiB)).join();
+        FileWrapper shared = sharee.getByPath(dir).join().get();
+        PublicKeyHash ownerKey = shared.owner();
+        SigningPrivateKeyAndPublicHash parent = shared.signingPair();
+        SigningKeyPair pair = SigningKeyPair.random(crypto.random, crypto.signer);
+
+        // two commits create the same child, a retry say: the first registers it and is still writing its blocks
+        Runnable takeBackFirst = quotaFilter().registerNewWriter(ownerKey, parent.publicKeyHash,
+                ContentAddressedStorage.hashKey(pair.publicSigningKey));
+        // the second lands
+        NetworkAccess net = network.clear();
+        SigningPrivateKeyAndPublicHash[] child = new SigningPrivateKeyAndPublicHash[1];
+        net.synchronizer.applyComplexUpdate(ownerKey, parent, (s, committer) ->
+                CryptreeNode.initAndAuthoriseSigner(ownerKey, parent, pair, net, s, committer)
+                        .thenApply(made -> { child[0] = made.right; return made.left; })).join();
+        awaitUsageUpdate();
+        // then the first is refused, and takes back what it registered, which is in use now
+        takeBackFirst.run();
+
+        assertRefusedForTheCap(() -> fillWriter(ownerKey, child[0]));
+    }
+
+    @Test
+    public void aWriterNamedAgainIsCountedAgainWhenTheQueueIsBehind() throws Exception {
+        UserContext owner = signUp();
+        UserContext sharee = signUp();
+        PeergosNetworkUtils.friendBetweenGroups(List.of(owner), List.of(sharee));
+        Path dir = sharedDir(owner, "team", sharee);
+        owner.getByPath(dir).join().get().mkdir("nested", owner.network, false, owner.mirrorBatId(), crypto).join();
+        Path nested = dir.resolve("nested");
+        owner.shareWriteAccessWith(nested, Set.of(sharee.username)).join();
+        owner.setWriteShareQuota(dir, Optional.of(1024L * KiB)).join();
+        upload(sharee, nested, "file", 600 * KiB);
+        awaitUsageUpdate();
+        long counted = owner.getWriteShareQuota(dir).join().used;
+        Assert.assertTrue(counted >= 600 * KiB);
+
+        // the sharee drops the nested writing space from the parent, and the server forgets it
+        PublicKeyHash ownerKey = sharee.getByPath(dir).join().get().owner();
+        SigningPrivateKeyAndPublicHash parent = sharee.getByPath(dir).join().get().signingPair();
+        SigningPrivateKeyAndPublicHash child = sharee.getByPath(nested).join().get().signingPair();
+        NetworkAccess net = network.clear();
+        net.synchronizer.applyComplexUpdate(ownerKey, parent, (s, committer) ->
+                CryptreeNode.deAuthoriseSigner(ownerKey, parent, child.publicKeyHash, net, s, committer)).join();
+        awaitUsageUpdate();
+
+        // and names it again, its data still there, while the usage queue is busy with the parent
+        java.lang.reflect.Method lockOf = SpaceCheckingKeyFilter.class.getDeclaredMethod("getWriterLock", PublicKeyHash.class);
+        lockOf.setAccessible(true);
+        Object parentLock = lockOf.invoke(null, parent.publicKeyHash);
+        java.util.concurrent.CountDownLatch held = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch named = new java.util.concurrent.CountDownLatch(1);
+        Thread busy = new Thread(() -> {
+            synchronized (parentLock) {
+                held.countDown();
+                try {
+                    named.await(20, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (InterruptedException e) {}
+            }
+        });
+        busy.start();
+        held.await();
+        NetworkAccess net2 = network.clear();
+        OwnerProof proof = OwnerProof.build(child, parent.publicKeyHash).join();
+        IpfsTransaction.call(ownerKey, tid -> net2.synchronizer.applyComplexUpdate(ownerKey, parent, (s, committer) -> {
+            CommittedWriterData current = s.get(parent);
+            return current.props.get().addOwnedKeyAndCommit(ownerKey, parent, proof, current.hash, current.sequence, net2, committer, tid);
+        }), net2.dhtClient).join();
+        named.countDown();
+        busy.join();
+        awaitUsageUpdate();
+
+        long recounted = owner.getWriteShareQuota(dir).join().used;
+        Assert.assertTrue("The data of a writer named again isn't counted under the cap: " + recounted + " of " + counted,
+                recounted >= counted - 50 * KiB);
+        assertRefusedForTheCap(() -> upload(sharee, dir, "more", 600 * KiB));
     }
 
     /** Per block signatures, as a client's own uploads carry. */

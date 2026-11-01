@@ -346,6 +346,10 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
                     state.addWriter(current.owner, owned);
                 }
                 Set<PublicKeyHash> ownedHere = ownKeys(state, current.owner, updatedOwned);
+                // What the replaced root named. A child's edge can be recorded ahead of its parent's update, so the
+                // store's edges alone don't say which children this update adds or drops.
+                Set<PublicKeyHash> namedBefore = DeletableContentAddressedStorage.getDirectOwnedKeys(owner, writer, current.target(),
+                        (h, s) -> DeletableContentAddressedStorage.getWriterData(us, owner, h, s, false, ourId, hasher, dht), dht, hasher).join();
                 UserUsage usage = state.getUsage(current.owner);
                 boolean initialErrored = usage.isErrored();
                 String username = current.owner;
@@ -356,9 +360,7 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
                 removedChildren.removeAll(ownedHere);
                 // only children the replaced root owned: a new writer's edge is recorded ahead of its parent's pointer
                 // update, and an earlier update of the parent still in the queue never named it
-                if (! removedChildren.isEmpty())
-                    removedChildren.retainAll(DeletableContentAddressedStorage.getDirectOwnedKeys(owner, writer, current.target(),
-                            (h, s) -> DeletableContentAddressedStorage.getWriterData(us, owner, h, s, false, ourId, hasher, dht), dht, hasher).join());
+                removedChildren.retainAll(namedBefore);
                 processRemovedOwnedKeys(state, owner, writer, removedChildren, mutable, quotaAdmin, dht, hasher);
                 HashSet<PublicKeyHash> addedOwnedKeys = new HashSet<>(ownedHere);
                 addedOwnedKeys.removeAll(current.ownedKeys());
@@ -370,7 +372,12 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
                     cached.confirmUsage(writer, changeInStorage);
                     cached.setErrored(errored);
                 }
-                for (PublicKeyHash added : addedOwnedKeys) {
+                // Each child named anew is counted from its pointer, with its edge recorded ahead or not: one named
+                // again after it was dropped has data the store stopped counting when it was dropped.
+                HashSet<PublicKeyHash> namedNow = new HashSet<>(ownedHere);
+                namedNow.removeAll(namedBefore);
+                namedNow.addAll(addedOwnedKeys);
+                for (PublicKeyHash added : namedNow) {
                     state.addWriter(current.owner, added);
                     WriterUsage currentAdded = state.getUsage(added);
                     MaybeMultihash updatedRoot = mutable.getPointerTarget(owner, added, dht).join().updated;
@@ -708,14 +715,19 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
                     return nothing;
                 boolean edgeAdded = usageStore.addOwnedKey(parent, writer);
                 boolean newWriter = writerAdded;
+                // A commit made alongside this one, that creates the same writer, may have landed it meanwhile.
+                // What has landed stays: taken back, the writer would write under no cap until its parent's next
+                // update. Under the lock, so no registration comes in between.
                 return () -> {
-                    try {
-                        if (newWriter)
-                            forgetWriter(username, writer);
-                        else if (edgeAdded)
-                            usageStore.removeOwnedKey(parent, writer);
-                    } catch (Exception e) {
-                        LOG.log(Level.WARNING, "Couldn't take back new writer " + writer + " of owner " + owner, e);
+                    synchronized (lock) {
+                        try {
+                            if (edgeAdded && ! namesWriter(owner, parent, writer))
+                                usageStore.removeOwnedKey(parent, writer);
+                            if (newWriter && usageStore.getParents(writer).isEmpty())
+                                forgetWriter(username, owner, writer);
+                        } catch (Exception e) {
+                            LOG.log(Level.WARNING, "Couldn't take back new writer " + writer + " of owner " + owner, e);
+                        }
                     }
                 };
             } catch (Exception e) {
@@ -734,8 +746,9 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
     }
 
     /** Forget a writer a refused commit registered, with its bytes in flight, and any writer registered under it
-     *  meanwhile: with nothing above them they would write under no cap. */
-    private void forgetWriter(String username, PublicKeyHash writer) {
+     *  meanwhile: with nothing above them they would write under no cap. One with a pointer has landed, in
+     *  another commit, and stays; so its usage is still nothing when it goes. */
+    private void forgetWriter(String username, PublicKeyHash owner, PublicKeyHash writer) {
         getUsage(username, usageStore).clearPending(writer);
         Set<PublicKeyHash> children;
         try {
@@ -743,10 +756,20 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
         } catch (IllegalStateException gone) {
             return; // forgotten already, with its children, by an undo nested in this one
         }
+        if (mutable.getPointerTarget(owner, writer, dht).join().updated.isPresent())
+            return;
         usageStore.removeWriter(writer);
         for (PublicKeyHash child : children)
             if (usageStore.getParents(child).isEmpty())
-                forgetWriter(username, child);
+                forgetWriter(username, owner, child);
+    }
+
+    /** Whether the parent's committed root names the writer as one it owns */
+    private boolean namesWriter(PublicKeyHash owner, PublicKeyHash parent, PublicKeyHash writer) {
+        List<Multihash> us = List.of(ourId.bareMultihash());
+        return DeletableContentAddressedStorage.getDirectOwnedKeys(owner, parent, mutable,
+                (h, s) -> DeletableContentAddressedStorage.getWriterData(us, owner, h, s, false, ourId, hasher, dht),
+                dht, hasher).join().contains(writer);
     }
 
     /** A write was attempted with a writer that is absent from the usage store. If the writer is reachable through
