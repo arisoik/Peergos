@@ -22,8 +22,13 @@ public interface WriterUsageStore {
 
     /** Record that a registered writer owns another, ahead of the parent's pointer update that names it, so that
      *  the caps over the parent bound the child's first writes. Does nothing if the edge is already there.
+     *
+     * @return whether the edge is new
      */
-    void addOwnedKey(PublicKeyHash parent, PublicKeyHash owned);
+    boolean addOwnedKey(PublicKeyHash parent, PublicKeyHash owned);
+
+    /** Take back an edge recorded ahead of a commit that was then refused */
+    void removeOwnedKey(PublicKeyHash parent, PublicKeyHash owned);
 
     /** Forget a writer that nothing owns any more, so it can't write again without proving it is owned */
     void removeWriter(PublicKeyHash writer);

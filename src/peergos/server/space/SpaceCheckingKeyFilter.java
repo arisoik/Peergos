@@ -650,15 +650,17 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
      *  parent's pointer update has been processed, and the commit's own blocks for it would be charged to
      *  the owner alone, past any cap over the parent.
      *
-     * @return true if the writer is now registered
+     * @return what takes the registration back if the commit is refused, leaving alone what was there already: a
+     *         writer it made would otherwise stay registered, and write outside every cap once its parent is gone
      */
-    public boolean registerNewWriter(PublicKeyHash owner, PublicKeyHash parent, PublicKeyHash writer) {
+    public Runnable registerNewWriter(PublicKeyHash owner, PublicKeyHash parent, PublicKeyHash writer) {
+        Runnable nothing = () -> {};
         Object lock = healLocks.computeIfAbsent(owner, o -> new Object());
         synchronized (lock) {
             try {
                 String username = core.getUsername(owner).join();
                 if (! quotaAdmin.getLocalUsernames().contains(username))
-                    return false;
+                    return nothing;
                 // The parent first: a writer registered without its edge would write under no cap. The
                 // parent has a pointer already, so the self heal finds it if the store is missing it.
                 String parentUser;
@@ -666,29 +668,37 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
                     parentUser = usageStore.getOwner(parent);
                 } catch (IllegalStateException absent) {
                     if (! registerMissedWriters(owner, parent))
-                        return false;
+                        return nothing;
                     parentUser = usageStore.getOwner(parent);
                 }
                 // only the owner's own writers vouch for a writer in their space: another user's key, sent in a
                 // commit for this owner, must not register one here, whatever the rest of that commit does
                 if (! username.equals(parentUser))
-                    return false;
+                    return nothing;
                 String writerUser;
+                boolean writerAdded = false;
                 try {
                     writerUser = usageStore.getOwner(writer);
                 } catch (IllegalStateException absent) {
                     usageStore.addUserIfAbsent(username);
                     usageStore.addWriter(username, writer);
                     writerUser = username;
+                    writerAdded = true;
                 }
                 // a writer of another user's stays theirs: an edge to it would count their data under this owner's caps
                 if (! username.equals(writerUser))
-                    return false;
-                usageStore.addOwnedKey(parent, writer);
-                return true;
+                    return nothing;
+                boolean edgeAdded = usageStore.addOwnedKey(parent, writer);
+                boolean newWriter = writerAdded;
+                return () -> {
+                    if (newWriter)
+                        usageStore.removeWriter(writer);
+                    else if (edgeAdded)
+                        usageStore.removeOwnedKey(parent, writer);
+                };
             } catch (Exception e) {
                 LOG.log(Level.WARNING, "Couldn't register new writer " + writer + " of owner " + owner, e);
-                return false;
+                return nothing;
             }
         }
     }

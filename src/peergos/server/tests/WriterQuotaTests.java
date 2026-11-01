@@ -261,10 +261,12 @@ public class WriterQuotaTests {
             random.nextBytes(block);
             blocks.add(block);
         }
+        SigningPrivateKeyAndPublicHash[] made = new SigningPrivateKeyAndPublicHash[1];
         try {
             // the child's new root links the blocks, so they travel in the same call as the pointers that create it
             net.synchronizer.applyComplexUpdate(ownerKey, parent, (s, committer) ->
                     CryptreeNode.initAndAuthoriseSigner(ownerKey, parent, SigningKeyPair.random(crypto.random, crypto.signer), net, s, committer)
+                            .thenApply(child -> { made[0] = child.right; return child; })
                             .thenCompose(child -> IpfsTransaction.call(ownerKey,
                                     tid -> signed(child.right, blocks).thenCompose(sigs -> net.dhtClient.putRaw(ownerKey,
                                                     child.right.publicKeyHash, sigs, blocks, tid, x -> {}))
@@ -283,6 +285,24 @@ public class WriterQuotaTests {
             String message = peergos.shared.util.Exceptions.getRootCause(e).getMessage();
             Assert.assertTrue(String.valueOf(message), message != null && message.contains("Storage quota reached"));
         }
+
+        // the refused commit takes its key back with it: kept, it would write outside every cap once the share is gone
+        owner.unShareWriteAccessWith(dir, Set.of(sharee.username)).join();
+        assertCannotCommit(made[0], ownerKey, "a key from a refused commit, after the share was revoked");
+    }
+
+    /** Commits an empty writing space under this key, its own first pointer */
+    private void assertCannotCommit(SigningPrivateKeyAndPublicHash key, PublicKeyHash owner, String what) {
+        NetworkAccess net = network.clear();
+        try {
+            IpfsTransaction.call(owner, tid -> WriterData.createEmpty(owner, key, net.dhtClient, crypto.hasher, tid)
+                            .thenCompose(wd -> net.synchronizer.applyComplexUpdate(owner, key, (s, committer) ->
+                                    committer.commit(owner, key, wd, new CommittedWriterData(MaybeMultihash.empty(), Optional.empty(), Optional.empty()), tid))),
+                    net.dhtClient).join();
+        } catch (Exception refused) {
+            return;
+        }
+        Assert.fail("Committed with " + what);
     }
 
     /** Per block signatures, as a client's own uploads carry. */

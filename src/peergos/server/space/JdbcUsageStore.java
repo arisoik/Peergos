@@ -265,17 +265,39 @@ public class JdbcUsageStore implements UsageStore {
     }
 
     @Override
-    public void addOwnedKey(PublicKeyHash parent, PublicKeyHash owned) {
+    public boolean addOwnedKey(PublicKeyHash parent, PublicKeyHash owned) {
         try (Connection conn = getConnection(true, false);
              PreparedStatement insertOwned = conn.prepareStatement(commands.insertOrIgnoreCommand("INSERT ", "INTO ownedkeys (parent_id, owned_id) VALUES(?, ?)"))) {
             insertOwned.setInt(1, getWriterId(parent, conn));
             insertOwned.setInt(2, getWriterId(owned, conn));
             if (insertOwned.executeUpdate() == 0)
+                return false;
+        } catch (SQLException sqe) {
+            LOG.log(Level.WARNING, sqe.getMessage(), sqe);
+            throw new RuntimeException(sqe);
+        }
+        ownedKeysChanged(owned);
+        return true;
+    }
+
+    @Override
+    public void removeOwnedKey(PublicKeyHash parent, PublicKeyHash owned) {
+        try (Connection conn = getConnection(true, false);
+             // nothing to do for a writer that has gone already, as a new one does with all its edges
+             PreparedStatement deleteOwned = conn.prepareStatement("DELETE FROM ownedkeys WHERE "
+                     + "parent_id = (SELECT id FROM writers WHERE key_hash = ?) AND owned_id = (SELECT id FROM writers WHERE key_hash = ?);")) {
+            deleteOwned.setBytes(1, parent.toBytes());
+            deleteOwned.setBytes(2, owned.toBytes());
+            if (deleteOwned.executeUpdate() == 0)
                 return;
         } catch (SQLException sqe) {
             LOG.log(Level.WARNING, sqe.getMessage(), sqe);
             throw new RuntimeException(sqe);
         }
+        ownedKeysChanged(owned);
+    }
+
+    private void ownedKeysChanged(PublicKeyHash owned) {
         for (UsageListener listener : listeners) {
             try {
                 listener.usageChanged(owned, 0, true);

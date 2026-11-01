@@ -38,14 +38,14 @@ public class BulkCommitStorage extends DelegatingStorage {
     private final DeletableContentAddressedStorage unfiltered;
     private final MutablePointers pointers;
     private final Hasher hasher;
-    private final TriFunction<PublicKeyHash, PublicKeyHash, PublicKeyHash, Boolean> registerWriter;
+    private final TriFunction<PublicKeyHash, PublicKeyHash, PublicKeyHash, Runnable> registerWriter;
     private final CommitQuota quota;
 
     public BulkCommitStorage(ContentAddressedStorage target,
                              DeletableContentAddressedStorage unfiltered,
                              MutablePointers pointers,
                              Hasher hasher,
-                             TriFunction<PublicKeyHash, PublicKeyHash, PublicKeyHash, Boolean> registerWriter,
+                             TriFunction<PublicKeyHash, PublicKeyHash, PublicKeyHash, Runnable> registerWriter,
                              CommitQuota quota) {
         super(target);
         this.target = target;
@@ -83,21 +83,28 @@ public class BulkCommitStorage extends DelegatingStorage {
                 .thenCompose(hashes -> updates(owner, commit)
                         .thenCompose(updates -> verifyBlockLists(owner, commit, hashes)
                                 .thenCompose(x -> verify(owner, commit, hashes, updates))
-                                .thenCompose(inCall -> registerNewWriters(owner, commit, updates, inCall)
-                                        .thenApply(y -> inCall))
-                                .thenCompose(inCall -> withTransaction(owner, commit.tid, commit.hasPointerUpdate(),
-                                        // the transaction has to outlive the pointer update, or the blocks
-                                        // it holds are collectable in the window before they are reachable
-                                        tid -> writeBlocks(owner, commit, updates, inCall, tid)
-                                                .thenCompose(written -> {
-                                                    List<SignedPointerUpdate> signed = commit.writers.stream()
-                                                            .flatMap(w -> w.pointer.stream())
-                                                            .collect(Collectors.toList());
-                                                    if (signed.isEmpty())
-                                                        return Futures.of(written);
-                                                    return pointers.setPointers(owner, signed)
-                                                            .thenApply(b -> written);
-                                                })))));
+                                .thenCompose(inCall -> {
+                                    List<Runnable> undo = registerNewWriters(owner, commit, updates, inCall);
+                                    // from a future, as a refusal is thrown before the transaction's future exists
+                                    return Futures.of(true).thenCompose(x -> withTransaction(owner, commit.tid, commit.hasPointerUpdate(),
+                                            // the transaction has to outlive the pointer update, or the blocks
+                                            // it holds are collectable in the window before they are reachable
+                                            tid -> writeBlocks(owner, commit, updates, inCall, tid)
+                                                    .thenCompose(written -> {
+                                                        List<SignedPointerUpdate> signed = commit.writers.stream()
+                                                                .flatMap(w -> w.pointer.stream())
+                                                                .collect(Collectors.toList());
+                                                        if (signed.isEmpty())
+                                                            return Futures.of(written);
+                                                        return pointers.setPointers(owner, signed)
+                                                                .thenApply(b -> written);
+                                                    })))
+                                            // a refused commit takes back the writers it registered
+                                            .whenComplete((written, refused) -> {
+                                                if (refused != null)
+                                                    undo.forEach(Runnable::run);
+                                            });
+                                })));
     }
 
     /** Apply a batch signed block write for an owner whose home server we are.
@@ -223,16 +230,16 @@ public class BulkCommitStorage extends DelegatingStorage {
      *  signed WriterData names it as an owned key - which is what lets a parent and the child it creates
      *  commit together, rather than the child's blocks having to wait for the parent's pointer to land.
      */
-    private CompletableFuture<Boolean> registerNewWriters(PublicKeyHash owner,
-                                                          BulkCommit commit,
-                                                          List<Optional<PointerUpdate>> updates,
-                                                          Map<Cid, byte[]> cborInCall) {
+    private List<Runnable> registerNewWriters(PublicKeyHash owner,
+                                              BulkCommit commit,
+                                              List<Optional<PointerUpdate>> updates,
+                                              Map<Cid, byte[]> cborInCall) {
         List<PublicKeyHash> newWriters = new ArrayList<>();
         for (int i = 0; i < commit.writers.size(); i++)
             if (updates.get(i).map(u -> ! u.original.isPresent()).orElse(false))
                 newWriters.add(commit.writers.get(i).writer);
         if (newWriters.isEmpty())
-            return Futures.of(true);
+            return Collections.emptyList();
 
         ContentAddressedStorage withCallBlocks = overlay(cborInCall);
         // Only a writer that isn't itself being created here can vouch for one that is, so widen the set
@@ -271,8 +278,9 @@ public class BulkCommitStorage extends DelegatingStorage {
         // A writer this call doesn't vouch for may still be provable from what is already committed,
         // which is exactly what the quota check's own self heal does, so leave those to it.
         // every parent that names it, so each one's caps bound it
-        provenHere.forEach((newWriter, parents) -> parents.forEach(parent -> registerWriter.apply(owner, parent, newWriter)));
-        return Futures.of(true);
+        List<Runnable> undo = new ArrayList<>();
+        provenHere.forEach((newWriter, parents) -> parents.forEach(parent -> undo.add(registerWriter.apply(owner, parent, newWriter))));
+        return undo;
     }
 
     /** A view of the store with this call's blocks in it, for reading a graph the call is only proposing. */
