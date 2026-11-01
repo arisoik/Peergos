@@ -337,6 +337,11 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
 
                 HashSet<PublicKeyHash> removedChildren = new HashSet<>(current.ownedKeys());
                 removedChildren.removeAll(updatedOwned);
+                // only children the replaced root owned: a new writer's edge is recorded ahead of its parent's pointer
+                // update, and an earlier update of the parent still in the queue never named it
+                if (! removedChildren.isEmpty())
+                    removedChildren.retainAll(DeletableContentAddressedStorage.getDirectOwnedKeys(owner, writer, current.target(),
+                            (h, s) -> DeletableContentAddressedStorage.getWriterData(us, owner, h, s, false, ourId, hasher, dht), dht, hasher).join());
                 processRemovedOwnedKeys(state, owner, writer, removedChildren, mutable, quotaAdmin, dht, hasher);
                 HashSet<PublicKeyHash> addedOwnedKeys = new HashSet<>(updatedOwned);
                 addedOwnedKeys.removeAll(current.ownedKeys());
