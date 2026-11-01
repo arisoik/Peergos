@@ -3,6 +3,7 @@ package peergos.server.tests;
 import org.junit.*;
 import peergos.server.*;
 import peergos.server.space.SpaceCheckingKeyFilter;
+import peergos.server.space.UsageStore;
 import peergos.server.util.*;
 import peergos.shared.*;
 import peergos.shared.cbor.*;
@@ -292,15 +293,10 @@ public class WriterQuotaTests {
         assertCannotCommit(made[0], ownerKey, "a key from a refused commit, after the share was revoked");
     }
 
-    /** Commits an empty writing space under this key, over whatever it has now, if anything */
+    /** Writes a small block under this key, over whatever it has now, if anything */
     private void assertCannotCommit(SigningPrivateKeyAndPublicHash key, PublicKeyHash owner, String what) {
-        NetworkAccess net = network.clear();
         try {
-            IpfsTransaction.call(owner, tid -> net.synchronizer.applyComplexUpdate(owner, key, (s, committer) ->
-                            WriterData.createEmpty(owner, key, net.dhtClient, crypto.hasher, tid)
-                                    .thenCompose(wd -> committer.commit(owner, key, wd, s.contains(key.publicKeyHash) ? s.get(key)
-                                            : new CommittedWriterData(MaybeMultihash.empty(), Optional.empty(), Optional.empty()), tid))),
-                    net.dhtClient).join();
+            write(owner, key, 1, KiB);
         } catch (Exception refused) {
             // refused for the key, not for anything else a commit can fail on
             String message = String.valueOf(peergos.shared.util.Exceptions.getRootCause(refused).getMessage());
@@ -359,12 +355,32 @@ public class WriterQuotaTests {
         return (SpaceCheckingKeyFilter) local.get(service.usage);
     }
 
+    private static UsageStore usageStore() throws Exception {
+        java.lang.reflect.Field store = SpaceCheckingKeyFilter.class.getDeclaredField("usageStore");
+        store.setAccessible(true);
+        return (UsageStore) store.get(quotaFilter());
+    }
+
+    /** A new key, its public key stored under the parent as a client stores one it is about to make a writer */
+    private SigningPrivateKeyAndPublicHash newKeyUnder(PublicKeyHash owner, SigningPrivateKeyAndPublicHash parent) {
+        NetworkAccess net = network.clear();
+        SigningKeyPair pair = SigningKeyPair.random(crypto.random, crypto.signer);
+        PublicKeyHash hash = net.dhtClient.putSigningKey(parent.secret.signMessage(pair.publicSigningKey.serialize()).join(), owner,
+                parent.publicKeyHash, pair.publicSigningKey, net.dhtClient.startTransaction(owner).join()).join();
+        return new SigningPrivateKeyAndPublicHash(hash, pair.secretSigningKey);
+    }
+
     /** About 1 MiB into a writer's own space, in one buffered commit */
     private void fillWriter(PublicKeyHash owner, SigningPrivateKeyAndPublicHash writer) {
+        write(owner, writer, 11, 90 * KiB);
+    }
+
+    /** Blocks into a writer's own space in one buffered commit, over what it has, or as its first write */
+    private void write(PublicKeyHash owner, SigningPrivateKeyAndPublicHash writer, int count, int size) {
         NetworkAccess net = network.clear();
         List<byte[]> blocks = new ArrayList<>();
-        for (int i = 0; i < 11; i++) {
-            byte[] block = new byte[90 * KiB];
+        for (int i = 0; i < count; i++) {
+            byte[] block = new byte[size];
             random.nextBytes(block);
             blocks.add(block);
         }
@@ -377,8 +393,11 @@ public class WriterQuotaTests {
                                     writer.publicKeyHash, sigs, List.of(links), tid));
                         })
                         .thenCompose(links -> {
-                            CommittedWriterData current = s.get(writer);
-                            return committer.commit(owner, writer, current.props.get().withChamp(links.get(0)), current, tid);
+                            CommittedWriterData current = s.contains(writer.publicKeyHash) ? s.get(writer)
+                                    : new CommittedWriterData(MaybeMultihash.empty(), Optional.empty(), Optional.empty());
+                            return (current.props.isPresent() ? Futures.of(current.props.get())
+                                    : WriterData.createEmpty(owner, writer, net.dhtClient, crypto.hasher, tid))
+                                    .thenCompose(wd -> committer.commit(owner, writer, wd.withChamp(links.get(0)), current, tid));
                         }),
                 net.dhtClient)).join();
     }
@@ -409,6 +428,106 @@ public class WriterQuotaTests {
         takeBackFirst.run();
 
         assertRefusedForTheCap(() -> fillWriter(ownerKey, child[0]));
+    }
+
+    @Test
+    public void aRefusedCommitDoesntReviveAWriterItsParentDropped() {
+        UserContext owner = signUp();
+        UserContext sharee = signUp();
+        PeergosNetworkUtils.friendBetweenGroups(List.of(owner), List.of(sharee));
+        Path dir = sharedDir(owner, "team", sharee);
+        owner.setWriteShareQuota(dir, Optional.of(256L * KiB)).join();
+        FileWrapper shared = sharee.getByPath(dir).join().get();
+        PublicKeyHash ownerKey = shared.owner();
+        SigningPrivateKeyAndPublicHash parent = shared.signingPair();
+        SigningKeyPair pair = SigningKeyPair.random(crypto.random, crypto.signer);
+        NetworkAccess net = network.clear();
+        SigningPrivateKeyAndPublicHash[] child = new SigningPrivateKeyAndPublicHash[1];
+        net.synchronizer.applyComplexUpdate(ownerKey, parent, (s, committer) ->
+                CryptreeNode.initAndAuthoriseSigner(ownerKey, parent, pair, net, s, committer)
+                        .thenApply(made -> { child[0] = made.right; return made.left; })).join();
+        awaitUsageUpdate();
+        // dropped by its parent, the child is forgotten; its pointer stays
+        NetworkAccess net2 = network.clear();
+        net2.synchronizer.applyComplexUpdate(ownerKey, parent, (s, committer) ->
+                CryptreeNode.deAuthoriseSigner(ownerKey, parent, child[0].publicKeyHash, net2, s, committer)).join();
+        awaitUsageUpdate();
+
+        // a commit names it again and claims to create it, which its pointer refutes: refused, it takes back what it
+        // registered, whatever pointer the child has
+        NetworkAccess net3 = network.clear();
+        try {
+            net3.synchronizer.applyComplexUpdate(ownerKey, parent, (s, committer) -> IpfsTransaction.call(ownerKey, tid -> {
+                CommittedWriterData current = s.get(parent);
+                return OwnerProof.build(child[0], parent.publicKeyHash)
+                        .thenCompose(proof -> current.props.get().addOwnedKeyAndCommit(ownerKey, parent, proof, current.hash, current.sequence, net3, committer, tid))
+                        .thenCompose(named -> WriterData.createEmpty(ownerKey, child[0], net3.dhtClient, crypto.hasher, tid)
+                                .thenCompose(wd -> committer.commit(ownerKey, child[0], wd, new CommittedWriterData(MaybeMultihash.empty(), Optional.empty(), Optional.empty()), tid))
+                                .thenApply(named::mergeAndOverwriteWith));
+            }, net3.dhtClient)).join();
+            Assert.fail("A commit creating a writer that has a pointer already landed");
+        } catch (Exception refused) {}
+        assertCannotCommit(child[0], ownerKey, "a dropped writer that a refused commit named again");
+    }
+
+    @Test
+    public void aRefusedCommitTakesBackAWriterWhoseOwnPointerLandedMeanwhile() throws Exception {
+        UserContext owner = signUp();
+        UserContext sharee = signUp();
+        PeergosNetworkUtils.friendBetweenGroups(List.of(owner), List.of(sharee));
+        Path dir = sharedDir(owner, "team", sharee);
+        owner.setWriteShareQuota(dir, Optional.of(256L * KiB)).join();
+        FileWrapper shared = sharee.getByPath(dir).join().get();
+        PublicKeyHash ownerKey = shared.owner();
+        SigningPrivateKeyAndPublicHash parent = shared.signingPair();
+        SigningPrivateKeyAndPublicHash child = newKeyUnder(ownerKey, parent);
+
+        // a commit creating the child registers it, and while it writes its blocks, another request lands the child's
+        // own first pointer, which its registration lets through
+        Runnable takeBack = quotaFilter().registerNewWriter(ownerKey, parent.publicKeyHash, child.publicKeyHash);
+        NetworkAccess net = network.clear();
+        IpfsTransaction.call(ownerKey, tid -> net.synchronizer.applyComplexUpdate(ownerKey, child, (s, committer) ->
+                        WriterData.createEmpty(ownerKey, child, net.dhtClient, crypto.hasher, tid)
+                                .thenCompose(wd -> committer.commit(ownerKey, child, wd, new CommittedWriterData(MaybeMultihash.empty(), Optional.empty(), Optional.empty()), tid))),
+                net.dhtClient).join();
+        // the first commit is refused: the parent never named the child, so its pointer doesn't keep it
+        takeBack.run();
+        assertCannotCommit(child, ownerKey, "a key whose own pointer landed while the commit making it was refused");
+    }
+
+    @Test
+    public void aRefusedCommitTakesBackAWriterItNamedUnderTwoParents() throws Exception {
+        UserContext owner = signUp();
+        UserContext sharee = signUp();
+        PeergosNetworkUtils.friendBetweenGroups(List.of(owner), List.of(sharee));
+        FileWrapper first = sharee.getByPath(sharedDir(owner, "first", sharee)).join().get();
+        FileWrapper second = sharee.getByPath(sharedDir(owner, "second", sharee)).join().get();
+        PublicKeyHash ownerKey = first.owner();
+        SigningPrivateKeyAndPublicHash child = newKeyUnder(ownerKey, first.signingPair());
+
+        // as a commit naming the child under both is registered, and then refused
+        Runnable underFirst = quotaFilter().registerNewWriter(ownerKey, first.signingPair().publicKeyHash, child.publicKeyHash);
+        Runnable underSecond = quotaFilter().registerNewWriter(ownerKey, second.signingPair().publicKeyHash, child.publicKeyHash);
+        underFirst.run();
+        underSecond.run();
+        assertCannotCommit(child, ownerKey, "a key a refused commit named under two parents");
+    }
+
+    @Test
+    public void anEdgeFromAnotherUsersWriterDoesntKeepARevokedKey() throws Exception {
+        UserContext owner = signUp();
+        UserContext sharee = signUp();
+        PeergosNetworkUtils.friendBetweenGroups(List.of(owner), List.of(sharee));
+        Path dir = sharedDir(owner, "team", sharee);
+        FileWrapper shared = sharee.getByPath(dir).join().get();
+        linkUnder(sharee, shared.signingPair(), sharee.signer);
+        awaitUsageUpdate();
+        // the edge an older version recorded for that
+        usageStore().addOwnedKey(sharee.signer.publicKeyHash, shared.signingPair().publicKeyHash);
+
+        owner.unShareWriteAccessWith(dir, Set.of(sharee.username)).join();
+        awaitUsageUpdate();
+        assertCannotCommit(shared.signingPair(), shared.owner(), "a revoked key another user's writer had an edge to");
     }
 
     @Test

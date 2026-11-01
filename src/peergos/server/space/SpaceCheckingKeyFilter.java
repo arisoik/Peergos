@@ -400,9 +400,12 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
                                                 Hasher hasher) {
         for (PublicKeyHash ownedKey : removed) {
             try {
-                // a key that has been moved to another parent is still in use, not orphaned
+                // a key that has been moved to another parent is still in use, not orphaned; another user's writer
+                // is no parent of it, whatever edge an older version recorded
                 Set<PublicKeyHash> otherParents = new HashSet<>(state.getParents(ownedKey));
                 otherParents.remove(parent);
+                String keyOwner = state.getOwner(ownedKey);
+                otherParents.removeIf(other -> ! keyOwner.equals(state.getOwner(other)));
                 if (! otherParents.isEmpty())
                     continue;
                 MaybeMultihash currentTarget = mutable.getPointerTarget(owner, ownedKey, dht).get().updated;
@@ -578,7 +581,9 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
         UserUsage usage = getUsage(username, usageStore);
 
         // Each check reserves the bytes as it passes, in one step, so two writes arriving together can't both
-        // fit where only one does. Whatever refuses later gives the reservations before it back.
+        // fit where only one does. Whatever refuses later gives the reservations before it back. For the user's
+        // own quota that holds until a write is refused: from then on each check reads the committed total
+        // afresh (getUsage), until a processed commit clears the flag.
         long pending = usage.getPending(writer);
         if (! usage.reserve(writer, size, quota, USAGE_TOLERANCE)) {
             usageStore.confirmUsage(username, writer, 0, true);
@@ -644,7 +649,8 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
             long change = changes.values().stream().mapToLong(x -> x).sum();
             long quota = getQuota(username, quotaAdmin);
             UserUsage usage = getUsage(username, usageStore);
-            // against what is committed and what other writes have reserved, or two at once could both fit
+            // against what is committed and what other writes have reserved. Nothing is reserved here, so two such
+            // commits can both pass, each fitting on its own; this is for a commit that frees space.
             if (usage.expectedUsage() + change > quota)
                 throw e;
             // a commit that shrinks a capped space is allowed, even if it is still over its cap afterwards. It is judged
@@ -675,8 +681,9 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
      *  parent's pointer update has been processed, and the commit's own blocks for it would be charged to
      *  the owner alone, past any cap over the parent.
      *
-     * @return what takes the registration back if the commit is refused, leaving alone what was there already: a
-     *         writer it made would otherwise stay registered, and write outside every cap once its parent is gone
+     * @return what takes the registration back if the commit is refused, leaving alone what a committed parent
+     *         names: a writer it made or linked would otherwise stay registered, and write outside every cap once
+     *         its parent is gone
      */
     public Runnable registerNewWriter(PublicKeyHash owner, PublicKeyHash parent, PublicKeyHash writer) {
         Runnable nothing = () -> {};
@@ -715,15 +722,16 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
                     return nothing;
                 boolean edgeAdded = usageStore.addOwnedKey(parent, writer);
                 boolean newWriter = writerAdded;
-                // A commit made alongside this one, that creates the same writer, may have landed it meanwhile.
-                // What has landed stays: taken back, the writer would write under no cap until its parent's next
-                // update. Under the lock, so no registration comes in between.
+                // A commit made alongside this one may have landed the same writer under this parent meanwhile, and
+                // what a committed parent names stays. A writer left with no parent goes, whichever commit
+                // registered it and whatever its own pointer says: it would write under no cap. Under the lock, so
+                // no registration comes in between.
                 return () -> {
                     synchronized (lock) {
                         try {
                             if (edgeAdded && ! namesWriter(owner, parent, writer))
                                 usageStore.removeOwnedKey(parent, writer);
-                            if (newWriter && usageStore.getParents(writer).isEmpty())
+                            if ((newWriter || edgeAdded) && usageStore.getParents(writer).isEmpty())
                                 forgetWriter(username, owner, writer);
                         } catch (Exception e) {
                             LOG.log(Level.WARNING, "Couldn't take back new writer " + writer + " of owner " + owner, e);
@@ -745,21 +753,22 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
         }
     }
 
-    /** Forget a writer a refused commit registered, with its bytes in flight, and any writer registered under it
-     *  meanwhile: with nothing above them they would write under no cap. One with a pointer has landed, in
-     *  another commit, and stays; so its usage is still nothing when it goes. */
+    /** Forget a writer that a refused commit registered or linked and that nothing owns now, with its bytes in
+     *  flight, and any writer registered under it meanwhile: with nothing above them they would write under no
+     *  cap. Its usage goes as a dropped child's does, as a write of its own may have landed in the meantime. */
     private void forgetWriter(String username, PublicKeyHash owner, PublicKeyHash writer) {
         getUsage(username, usageStore).clearPending(writer);
-        Set<PublicKeyHash> children;
+        WriterUsage registered;
         try {
-            children = usageStore.getUsage(writer).ownedKeys();
+            registered = usageStore.getUsage(writer);
         } catch (IllegalStateException gone) {
             return; // forgotten already, with its children, by an undo nested in this one
         }
-        if (mutable.getPointerTarget(owner, writer, dht).join().updated.isPresent())
-            return;
+        if (registered.target().isPresent())
+            processMutablePointerEvent(usageStore, owner, writer, registered.target(), MaybeMultihash.empty(),
+                    mutable, quotaAdmin, dht, hasher);
         usageStore.removeWriter(writer);
-        for (PublicKeyHash child : children)
+        for (PublicKeyHash child : registered.ownedKeys())
             if (usageStore.getParents(child).isEmpty())
                 forgetWriter(username, owner, child);
     }
