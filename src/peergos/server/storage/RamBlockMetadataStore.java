@@ -46,6 +46,8 @@ public class RamBlockMetadataStore implements BlockMetadataStore {
     @Override
     public Map<Cid, BlockMetadata> getAll(PublicKeyHash owner, List<Cid> blocks) {
         Map<Cid, BlockMetadata> res = new HashMap<>();
+        if (owner == null)
+            return res;
         for (Cid block : blocks) {
             if (Objects.equals(owner, owners.get(block)))
                 Optional.ofNullable(store.get(block)).ifPresent(m -> res.put(block, m));

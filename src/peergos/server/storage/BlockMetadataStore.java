@@ -25,7 +25,7 @@ public interface BlockMetadataStore {
      *  block itself and deriving its bats from the bytes.
      *
      *  Legacy rows predating partitioning have a null owner and match no owner, so callers gate this
-     *  on partitioning being complete.
+     *  on partitioning being complete. A null owner matches no row either.
      */
     Map<Cid, BlockMetadata> getAll(PublicKeyHash owner, List<Cid> blocks);
 

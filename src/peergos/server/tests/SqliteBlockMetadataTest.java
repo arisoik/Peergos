@@ -283,6 +283,35 @@ public class SqliteBlockMetadataTest {
         Assert.assertTrue(store.getAll(owner, List.of(block)).isEmpty());
     }
 
+    @Test
+    public void aNewOwnerEvictsTheOwnerScopedCache() throws Exception {
+        Path dir = Files.createTempDirectory("peergos-block-metadata");
+        BlockMetadataStore store = new CachingBlockMetadataStore(buildStore(dir.resolve("meta.sql")), 1000);
+        PublicKeyHash was = new PublicKeyHash(randomCid());
+        PublicKeyHash now = new PublicKeyHash(randomCid());
+
+        Cid block = randomCid();
+        store.put(was, block, "alpha", new BlockMetadata(1024, Collections.emptyList(), Collections.emptyList()));
+        Assert.assertTrue(store.getAll(was, List.of(block)).containsKey(block));
+
+        store.setOwner(now, block);
+        Assert.assertTrue("the old owner's cached row must not answer", store.getAll(was, List.of(block)).isEmpty());
+        Assert.assertTrue(store.getAll(now, List.of(block)).containsKey(block));
+    }
+
+    @Test
+    public void aNullOwnerMatchesNoRow() throws Exception {
+        Path dir = Files.createTempDirectory("peergos-block-metadata");
+        BlockMetadataStore sql = buildStore(dir.resolve("meta.sql"));
+        BlockMetadataStore ram = new RamBlockMetadataStore();
+        Cid owned = randomCid(), legacy = randomCid();
+        for (BlockMetadataStore store : List.of(sql, ram)) {
+            store.put(new PublicKeyHash(randomCid()), owned, "alpha", new BlockMetadata(1024, Collections.emptyList(), Collections.emptyList()));
+            store.put(null, legacy, "alpha", new BlockMetadata(1024, Collections.emptyList(), Collections.emptyList()));
+            Assert.assertTrue(store.getClass().getSimpleName(), store.getAll(null, List.of(owned, legacy)).isEmpty());
+        }
+    }
+
     private static BlockMetadataStore buildStore(Path file) throws Exception {
         Connection conn = new Sqlite.UncloseableConnection(Sqlite.build(file.toString()));
         return new JdbcBlockMetadataStore(() -> conn, new SqliteCommands());

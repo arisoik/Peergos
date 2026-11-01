@@ -148,11 +148,17 @@ public class JdbcBlockMetadataStore implements BlockMetadataStore {
 
     @Override
     public Map<Cid, BlockMetadata> getAll(List<Cid> blocks) {
-        return getAll(null, blocks);
+        return getAll(Optional.empty(), blocks);
     }
 
     @Override
     public Map<Cid, BlockMetadata> getAll(PublicKeyHash owner, List<Cid> blocks) {
+        if (owner == null)
+            return Collections.emptyMap();
+        return getAll(Optional.of(owner), blocks);
+    }
+
+    private Map<Cid, BlockMetadata> getAll(Optional<PublicKeyHash> owner, List<Cid> blocks) {
         if (blocks.isEmpty())
             return Collections.emptyMap();
 
@@ -161,7 +167,7 @@ public class JdbcBlockMetadataStore implements BlockMetadataStore {
                 .collect(Collectors.joining(","));
 
         String sql = "SELECT cid, links, batids, size FROM blockmetadata WHERE cid IN (" + placeholders + ")"
-                + (owner == null ? "" : " AND owner = ?") + ";";
+                + (owner.isPresent() ? " AND owner = ?" : "") + ";";
 
         try (Connection conn = getConnection(false, false);
              PreparedStatement stmt = conn.prepareStatement(sql)) {
@@ -169,8 +175,8 @@ public class JdbcBlockMetadataStore implements BlockMetadataStore {
             for (int i = 0; i < blocks.size(); i++) {
                 stmt.setBytes(i + 1, blocks.get(i).toBytes());
             }
-            if (owner != null)
-                stmt.setBytes(blocks.size() + 1, owner.toBytes());
+            if (owner.isPresent())
+                stmt.setBytes(blocks.size() + 1, owner.get().toBytes());
 
             ResultSet rs = stmt.executeQuery();
             Map<Cid, BlockMetadata> present = new HashMap<>();

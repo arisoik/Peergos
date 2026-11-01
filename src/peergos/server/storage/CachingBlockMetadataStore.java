@@ -90,11 +90,13 @@ public class CachingBlockMetadataStore implements BlockMetadataStore {
     @Override
     public void setOwner(PublicKeyHash owner, Cid block) {
         target.setOwner(owner, block);
+        ownedCache.remove(block);
     }
 
     @Override
     public void setOwnerAndVersion(PublicKeyHash owner, Cid block, String version) {
         target.setOwnerAndVersion(owner, block, version);
+        ownedCache.remove(block);
     }
 
     /** What a caller puts isn't cached: the store keeps the first row for a block and ignores a later one, and a
