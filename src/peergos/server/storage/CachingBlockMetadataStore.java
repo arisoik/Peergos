@@ -113,11 +113,12 @@ public class CachingBlockMetadataStore implements BlockMetadataStore {
         blocks.forEach(cache::remove);
     }
 
+    /** The row goes first, so a lookup in between can't cache it again after the eviction */
     @Override
     public void remove(Cid block) {
+        target.remove(block);
         cache.remove(block);
         ownedCache.remove(block);
-        target.remove(block);
     }
 
     @Override
