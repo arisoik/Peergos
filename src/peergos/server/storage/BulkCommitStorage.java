@@ -286,8 +286,8 @@ public class BulkCommitStorage extends DelegatingStorage {
             remaining.removeAll(vouched);
         }
         // A writer this call doesn't vouch for may still be provable from what is already committed,
-        // which is exactly what the quota check's own self heal does, so leave those to it.
-        // every parent that names it, so each one's caps bound it
+        // which is exactly what the quota check's own self heal does, so leave those to it. A writer this
+        // call does vouch for is linked under every parent that names it, so each one's caps bound it.
         List<Runnable> undo = new ArrayList<>();
         provenHere.forEach((newWriter, parents) -> parents.forEach(parent -> undo.add(registerWriter.apply(owner, parent, newWriter))));
         return undo;

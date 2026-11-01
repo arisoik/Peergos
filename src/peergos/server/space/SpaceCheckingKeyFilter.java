@@ -160,16 +160,18 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
                     long deltaUsage = updatedSize - writerUsage.directRetainedStorage();
                     Set<PublicKeyHash> directOwnedKeys = DeletableContentAddressedStorage.getDirectOwnedKeys(owner, writerKey, mutable,
                             (h, s) -> DeletableContentAddressedStorage.getWriterData(us, owner, h, s, false, ourId, hasher, dht), dht, hasher).join();
-                    List<PublicKeyHash> newOwnedKeys = directOwnedKeys.stream()
+                    for (PublicKeyHash key : directOwnedKeys)
+                        store.addWriter(writerUsage.owner, key);
+                    Set<PublicKeyHash> ownedHere = ownKeys(store, writerUsage.owner, directOwnedKeys);
+                    List<PublicKeyHash> newOwnedKeys = ownedHere.stream()
                             .filter(key -> !writerUsage.ownedKeys().contains(key))
                             .collect(Collectors.toList());
                     for (PublicKeyHash newOwnedKey : newOwnedKeys) {
-                        store.addWriter(writerUsage.owner, newOwnedKey);
                         processMutablePointerEvent(store, owner, newOwnedKey, MaybeMultihash.empty(),
                                 mutable.getPointerTarget(owner, newOwnedKey, dht).get().updated, mutable, quotas, dht, hasher);
                     }
                     HashSet<PublicKeyHash> removedOwnedKeys = new HashSet<>(writerUsage.ownedKeys());
-                    removedOwnedKeys.removeAll(directOwnedKeys);
+                    removedOwnedKeys.removeAll(ownedHere);
                     boolean updated = store.updateWriterUsageAtomically(writerKey, writerUsage.target(), rootHash,
                             removedOwnedKeys, new HashSet<>(newOwnedKeys), updatedSize, deltaUsage,
                             store.getUsage(writerUsage.owner).isErrored());
@@ -207,7 +209,9 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
     }
 
     public void accept(MutableEvent event) {
-        mutableQueue.add(event);
+        // the pointer has moved by now, so a full queue mustn't fail the commit that moved it
+        if (! mutableQueue.offer(event))
+            LOG.warning("Mutable event queue full, usage of writer " + event.writer + " waits for its next update");
         try {
             prepareMutablePointerChange(event, dht, usageStore, hasher);
         } catch (Exception e) {
@@ -258,13 +262,21 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
                 DeletableContentAddressedStorage.getDirectOwnedKeys(event.owner, event.writer, pointerUpdate.updated,
                         (h, s) -> DeletableContentAddressedStorage.getWriterData(us, event.owner, h, s, false, ourId, hasher, dht), dht, hasher).join();
         String owner = usageStore.getOwner(event.writer);
-        for (PublicKeyHash owned : updatedOwned) {
+        for (PublicKeyHash owned : updatedOwned)
             usageStore.addWriter(owner, owned);
-            // linked now rather than when the queue gets to it, so a child's first writes already count under its
-            // parent's caps; another user's writer stays theirs
-            if (owner.equals(usageStore.getOwner(owned)))
-                usageStore.addOwnedKey(event.writer, owned);
-        }
+        // linked now rather than when the queue gets to it, so a child's first writes already count under its
+        // parent's caps
+        for (PublicKeyHash owned : ownKeys(usageStore, owner, updatedOwned))
+            usageStore.addOwnedKey(event.writer, owned);
+    }
+
+    /** The keys a writer names that are its owner's own. A key of another user's, named with an owner proof it
+     *  signed, stays theirs: an edge to it would keep it registered after its owner revokes it, and count their
+     *  data under this user's caps. */
+    private static Set<PublicKeyHash> ownKeys(UsageStore state, String username, Set<PublicKeyHash> named) {
+        return named.stream()
+                .filter(key -> username.equals(state.getOwner(key)))
+                .collect(Collectors.toSet());
     }
 
     private void processMutablePointerEvent(MutableEvent event) {
@@ -333,6 +345,7 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
                 for (PublicKeyHash owned : updatedOwned) {
                     state.addWriter(current.owner, owned);
                 }
+                Set<PublicKeyHash> ownedHere = ownKeys(state, current.owner, updatedOwned);
                 UserUsage usage = state.getUsage(current.owner);
                 boolean initialErrored = usage.isErrored();
                 String username = current.owner;
@@ -340,14 +353,14 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
                 boolean errored = initialErrored && usage.totalUsage() > quota;
 
                 HashSet<PublicKeyHash> removedChildren = new HashSet<>(current.ownedKeys());
-                removedChildren.removeAll(updatedOwned);
+                removedChildren.removeAll(ownedHere);
                 // only children the replaced root owned: a new writer's edge is recorded ahead of its parent's pointer
                 // update, and an earlier update of the parent still in the queue never named it
                 if (! removedChildren.isEmpty())
                     removedChildren.retainAll(DeletableContentAddressedStorage.getDirectOwnedKeys(owner, writer, current.target(),
                             (h, s) -> DeletableContentAddressedStorage.getWriterData(us, owner, h, s, false, ourId, hasher, dht), dht, hasher).join());
                 processRemovedOwnedKeys(state, owner, writer, removedChildren, mutable, quotaAdmin, dht, hasher);
-                HashSet<PublicKeyHash> addedOwnedKeys = new HashSet<>(updatedOwned);
+                HashSet<PublicKeyHash> addedOwnedKeys = new HashSet<>(ownedHere);
                 addedOwnedKeys.removeAll(current.ownedKeys());
                 boolean updated = state.updateWriterUsageAtomically(writer, current.target(), newRoot,
                         removedChildren, addedOwnedKeys,
@@ -723,9 +736,13 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
     /** Forget a writer a refused commit registered, with its bytes in flight, and any writer registered under it
      *  meanwhile: with nothing above them they would write under no cap. */
     private void forgetWriter(String username, PublicKeyHash writer) {
-        WriterUsage registered = usageStore.getUsage(writer);
-        Set<PublicKeyHash> children = registered == null ? Set.of() : registered.ownedKeys();
         getUsage(username, usageStore).clearPending(writer);
+        Set<PublicKeyHash> children;
+        try {
+            children = usageStore.getUsage(writer).ownedKeys();
+        } catch (IllegalStateException gone) {
+            return; // forgotten already, with its children, by an undo nested in this one
+        }
         usageStore.removeWriter(writer);
         for (PublicKeyHash child : children)
             if (usageStore.getParents(child).isEmpty())

@@ -134,8 +134,8 @@ public class WriterQuotas implements WriterUsageStore.UsageListener {
     public void usageChanged(PublicKeyHash writer, long delta, boolean ownedKeysChanged) {
         if (ownedKeysChanged) {
             // the writer may have left one capped subtree and joined another, so every cap's total is read again
-            // at its next use. This writer's own writes have landed, under whichever caps they were reserved in;
-            // other writers' writes in flight are kept
+            // at its next use. This writer's reservations go: its writes have landed by now, or it is being linked,
+            // unlinked or removed, with little if any of its writing still in flight. Other writers' are kept
             capUsage.values().forEach(cached -> cached.value.clearPending(writer));
             synchronized (ancestors) {
                 ancestors.clear();

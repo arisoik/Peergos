@@ -282,7 +282,7 @@ public class JdbcUsageStore implements UsageStore {
 
     @Override
     public void removeOwnedKey(PublicKeyHash parent, PublicKeyHash owned) {
-        // nothing to do for a writer that has gone already, as a new one does with all its edges
+        // a writer removed meanwhile took its edges with it, so there may be nothing to delete
         try (Connection conn = getConnection(true, false);
              PreparedStatement deleteOwned = conn.prepareStatement("DELETE FROM ownedkeys WHERE "
                      + "parent_id = (SELECT id FROM writers WHERE key_hash = ?) AND owned_id = (SELECT id FROM writers WHERE key_hash = ?);")) {
@@ -513,7 +513,6 @@ public class JdbcUsageStore implements UsageStore {
              PreparedStatement quotas = conn.prepareStatement("DELETE FROM writerquotas WHERE writer_id = ?;");
              PreparedStatement usage = conn.prepareStatement("DELETE FROM writerusage WHERE writer_id = ?;");
              PreparedStatement writers = conn.prepareStatement("DELETE FROM writers WHERE id = ?;")) {
-            owners.remove(writer);
             select.setBytes(1, writer.toBytes());
             ResultSet res = select.executeQuery();
             if (! res.next())
@@ -530,6 +529,8 @@ public class JdbcUsageStore implements UsageStore {
             LOG.log(Level.WARNING, sqe.getMessage(), sqe);
             throw new RuntimeException(sqe);
         }
+        // after the deletes, or a lookup in between caches the owner again and the writer outlives its removal
+        owners.remove(writer);
         notifyWriterQuotaChanged(writer, Optional.empty());
         // its edges went with it, and so do its bytes in flight under the caps above it
         ownedKeysChanged(writer);
@@ -589,7 +590,7 @@ public class JdbcUsageStore implements UsageStore {
         }
     }
 
-    private Map<PublicKeyHash, String> owners = new LRUCache<>(100);
+    private final Map<PublicKeyHash, String> owners = Collections.synchronizedMap(new LRUCache<>(100));
 
     @Override
     public String getOwner(PublicKeyHash writer) {

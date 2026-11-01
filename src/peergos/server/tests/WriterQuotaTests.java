@@ -291,18 +291,64 @@ public class WriterQuotaTests {
         assertCannotCommit(made[0], ownerKey, "a key from a refused commit, after the share was revoked");
     }
 
-    /** Commits an empty writing space under this key, its own first pointer */
+    /** Commits an empty writing space under this key, over whatever it has now, if anything */
     private void assertCannotCommit(SigningPrivateKeyAndPublicHash key, PublicKeyHash owner, String what) {
         NetworkAccess net = network.clear();
         try {
-            IpfsTransaction.call(owner, tid -> WriterData.createEmpty(owner, key, net.dhtClient, crypto.hasher, tid)
-                            .thenCompose(wd -> net.synchronizer.applyComplexUpdate(owner, key, (s, committer) ->
-                                    committer.commit(owner, key, wd, new CommittedWriterData(MaybeMultihash.empty(), Optional.empty(), Optional.empty()), tid))),
+            IpfsTransaction.call(owner, tid -> net.synchronizer.applyComplexUpdate(owner, key, (s, committer) ->
+                            WriterData.createEmpty(owner, key, net.dhtClient, crypto.hasher, tid)
+                                    .thenCompose(wd -> committer.commit(owner, key, wd, s.contains(key.publicKeyHash) ? s.get(key)
+                                            : new CommittedWriterData(MaybeMultihash.empty(), Optional.empty(), Optional.empty()), tid))),
                     net.dhtClient).join();
         } catch (Exception refused) {
+            // refused for the key, not for anything else a commit can fail on
+            String message = String.valueOf(peergos.shared.util.Exceptions.getRootCause(refused).getMessage());
+            Assert.assertTrue(message, message.contains("not present on this server") || message.contains("not allowed to write"));
             return;
         }
         Assert.fail("Committed with " + what);
+    }
+
+    /** The sharee names a key they hold as owned by one of their own writers, with a proof the key signs */
+    private void linkUnder(UserContext sharee, SigningPrivateKeyAndPublicHash key, SigningPrivateKeyAndPublicHash parent) {
+        NetworkAccess net = network.clear();
+        PublicKeyHash shareeKey = sharee.signer.publicKeyHash;
+        OwnerProof proof = OwnerProof.build(key, parent.publicKeyHash).join();
+        IpfsTransaction.call(shareeKey, tid -> net.synchronizer.applyComplexUpdate(shareeKey, parent, (s, committer) -> {
+            CommittedWriterData current = s.get(parent);
+            return current.props.get().addOwnedKeyAndCommit(shareeKey, parent, proof, current.hash, current.sequence, net, committer, tid);
+        }), net.dhtClient).join();
+    }
+
+    @Test
+    public void aShareeCantKeepARevokedKeyByNamingItUnderTheirOwnWriter() {
+        UserContext owner = signUp();
+        UserContext sharee = signUp();
+        PeergosNetworkUtils.friendBetweenGroups(List.of(owner), List.of(sharee));
+        Path dir = sharedDir(owner, "team", sharee);
+        FileWrapper shared = sharee.getByPath(dir).join().get();
+        linkUnder(sharee, shared.signingPair(), sharee.signer);
+        awaitUsageUpdate();
+
+        owner.unShareWriteAccessWith(dir, Set.of(sharee.username)).join();
+        awaitUsageUpdate();
+        assertCannotCommit(shared.signingPair(), shared.owner(), "a revoked key the sharee had named under their own writer");
+    }
+
+    @Test
+    public void aShareesCapDoesntReachAnOwnersFolderTheyNamedUnderIt() {
+        UserContext owner = signUp();
+        UserContext sharee = signUp();
+        UserContext third = signUp();
+        PeergosNetworkUtils.friendBetweenGroups(List.of(owner), List.of(sharee));
+        PeergosNetworkUtils.friendBetweenGroups(List.of(sharee), List.of(third));
+        Path dir = sharedDir(owner, "team", sharee);
+        Path mine = sharedDir(sharee, "mine", third);
+        linkUnder(sharee, sharee.getByPath(dir).join().get().signingPair(), sharee.getByPath(mine).join().get().signingPair());
+        awaitUsageUpdate();
+
+        sharee.setWriteShareQuota(mine, Optional.of(1L)).join();
+        upload(owner, dir, "ownersfile", 10 * KiB);
     }
 
     /** Per block signatures, as a client's own uploads carry. */
