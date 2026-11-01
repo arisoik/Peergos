@@ -2032,6 +2032,18 @@ public class PeergosNetworkUtils {
         MessageEnvelope newest = after.get(after.size() - 1);
         Assert.assertTrue("a's next message arrives", newest.payload instanceof ApplicationMessage
                 && ((ApplicationMessage) newest.payload).body.stream().anyMatch(c -> c.inlineText().contains("still here")));
+
+        // a message naming a folder among a's media for this chat rather than a file in it
+        String mediaFolder = real.path.substring(0, real.path.lastIndexOf('/'));
+        controllerA = msgA.sendMessage(controllerA, new ApplicationMessage(List.of(new Reference(
+                new FileRef(mediaFolder, real.cap, real.contentHash))))).join();
+        controllerB = msgB.mergeMessages(controllerB, a.username).join();
+        controllerA = msgA.sendMessage(controllerA, ApplicationMessage.text("past the folder")).join();
+        controllerB = msgB.mergeMessages(controllerB, a.username).join();
+        List<MessageEnvelope> pastFolder = controllerB.getMessages(0, 50).join();
+        MessageEnvelope latest = pastFolder.get(pastFolder.size() - 1);
+        Assert.assertTrue("merges carry on past a folder", latest.payload instanceof ApplicationMessage
+                && ((ApplicationMessage) latest.payload).body.stream().anyMatch(c -> c.inlineText().contains("past the folder")));
     }
 
     public static void deleteEmailApp(NetworkAccess network, Random random) {

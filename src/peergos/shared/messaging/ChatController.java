@@ -227,6 +227,11 @@ public class ChatController {
                         LOG.warning("Not copying a chat attachment that is no longer there");
                         return Futures.of(v);
                     }
+                    // Nor is a folder an attachment, and reading one fails this merge and every later one.
+                    if (found.get().isDirectory()) {
+                        LOG.warning("Not copying a folder named as a chat attachment");
+                        return Futures.of(v);
+                    }
                     FileWrapper f = found.get();
                     // A media file's name is unique, so one already there is this file, mirrored before or our own
                     // named back at us: skipped, or the merge would fail on it now and at every later merge of this chat.
