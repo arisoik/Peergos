@@ -2021,7 +2021,8 @@ public class PeergosNetworkUtils {
                 && ((ApplicationMessage) last.payload).body.stream().anyMatch(c -> c.inlineText().contains("and after it")));
 
         // a message naming an attachment of a's that isn't there, as one a has since deleted
-        String gonePath = real.path.substring(0, real.path.lastIndexOf('/')) + "/gone.txt";
+        // from the parsed path: a media path is written with the platform's own separator
+        String gonePath = "/" + realPath.getParent().resolve("gone.txt");
         controllerA = msgA.sendMessage(controllerA, new ApplicationMessage(List.of(new Reference(
                 new FileRef(gonePath, real.cap, real.contentHash))))).join();
         controllerB = msgB.mergeMessages(controllerB, a.username).join();
@@ -2034,7 +2035,7 @@ public class PeergosNetworkUtils {
                 && ((ApplicationMessage) newest.payload).body.stream().anyMatch(c -> c.inlineText().contains("still here")));
 
         // a message naming a folder among a's media for this chat rather than a file in it
-        String mediaFolder = real.path.substring(0, real.path.lastIndexOf('/'));
+        String mediaFolder = "/" + realPath.getParent();
         controllerA = msgA.sendMessage(controllerA, new ApplicationMessage(List.of(new Reference(
                 new FileRef(mediaFolder, real.cap, real.contentHash))))).join();
         controllerB = msgB.mergeMessages(controllerB, a.username).join();
