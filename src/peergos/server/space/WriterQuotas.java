@@ -118,9 +118,10 @@ public class WriterQuotas implements WriterUsageStore.UsageListener {
             return current.value;
         long committed = store.getSubtreeUsage(cap);
         if (current == null) {
-            UserUsage loaded = new UserUsage(committed);
-            capUsage.put(cap, new Timed<>(loaded, now));
-            return loaded;
+            // one object per cap, or two first writes would each reserve in their own and both fit
+            Timed<UserUsage> loaded = new Timed<>(new UserUsage(committed), now);
+            Timed<UserUsage> raced = capUsage.putIfAbsent(cap, loaded);
+            return (raced != null ? raced : loaded).value;
         }
         // The same object, with its total read again: the bytes of writes in flight stay with it. Judged
         // against the committed total alone, each of a burst of writes would fit where together they do not.

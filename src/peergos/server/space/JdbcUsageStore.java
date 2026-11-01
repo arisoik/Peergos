@@ -638,7 +638,7 @@ public class JdbcUsageStore implements UsageStore {
                                  Connection conn) throws SQLException {
         try (PreparedStatement writerSelect = conn.prepareStatement("SELECT id FROM writers WHERE key_hash = ?;");
              PreparedStatement deleteOwned = conn.prepareStatement("DELETE FROM ownedkeys WHERE parent_id = ? AND owned_id = ?;");
-             // a new writer's edge may already be in, recorded when the commit creating it was applied
+             // a new writer's edge may already be in, recorded while the commit creating it was being applied
              PreparedStatement insertOwned = conn.prepareStatement(commands.insertOrIgnoreCommand("INSERT ", "INTO ownedkeys (parent_id, owned_id) VALUES(?, ?)"))) {
             for (PublicKeyHash removed : removedOwnedKeys) {
                 writerSelect.setBytes(1, removed.toBytes());

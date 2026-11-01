@@ -673,12 +673,17 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
                 // commit for this owner, must not register one here, whatever the rest of that commit does
                 if (! username.equals(parentUser))
                     return false;
+                String writerUser;
                 try {
-                    usageStore.getOwner(writer);
+                    writerUser = usageStore.getOwner(writer);
                 } catch (IllegalStateException absent) {
                     usageStore.addUserIfAbsent(username);
                     usageStore.addWriter(username, writer);
+                    writerUser = username;
                 }
+                // a writer of another user's stays theirs: an edge to it would count their data under this owner's caps
+                if (! username.equals(writerUser))
+                    return false;
                 usageStore.addOwnedKey(parent, writer);
                 return true;
             } catch (Exception e) {
