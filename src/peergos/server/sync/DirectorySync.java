@@ -469,6 +469,9 @@ public class DirectorySync {
             } catch (ConcurrentChangeException e) {
                 LOG.accept("Sync: abandoning an interrupted " + (first.isLocalTarget ? "download" : "upload") + " of " +
                         first.sourceState.relPath + ", as it has changed since");
+            } catch (UnrepresentableNameException e) {
+                LOG.accept("Sync: abandoning an interrupted " + (first.isLocalTarget ? "download" : "upload") + " of " +
+                        first.sourceState.relPath + ": " + e.getMessage());
             } catch (Exception e) {
                 Throwable cause = Exceptions.getRootCause(e);
                 if (! (cause instanceof FileNotFoundException))
@@ -860,6 +863,9 @@ public class DirectorySync {
                             try {
                                 syncFile(synced, local, remote, localFS, remoteFS, syncedVersions, syncedBefore,
                                         localState, remoteState, syncLocalDeletes, syncRemoteDeletes, doneFiles, minPercentFreeSpace, crypto, stopDownload, LOG, progress);
+                            } catch (UnrepresentableNameException e) {
+                                // this file alone is left; it is reported every pass until it is renamed
+                                LOG.accept("Sync Local: skipped " + relativePath + ": " + e.getMessage());
                             } catch (IOException e) {
                                 failed.set(true);
                                 throw new RuntimeException(e);
@@ -870,9 +876,15 @@ public class DirectorySync {
                                 maxDownloadConcurrency.incrementAndGet();
                             }
                         }));
-                    } else
-                        syncFile(synced, local, remote, localFS, remoteFS, syncedVersions, syncedBefore, localState,
-                                remoteState, syncLocalDeletes, syncRemoteDeletes, doneFiles, minPercentFreeSpace, crypto, isCancelled, LOG, progress);
+                    } else {
+                        try {
+                            syncFile(synced, local, remote, localFS, remoteFS, syncedVersions, syncedBefore, localState,
+                                    remoteState, syncLocalDeletes, syncRemoteDeletes, doneFiles, minPercentFreeSpace, crypto, isCancelled, LOG, progress);
+                        } catch (UnrepresentableNameException e) {
+                            // this file alone is left; it is reported every pass until it is renamed
+                            LOG.accept("Sync Local: skipped " + relativePath + ": " + e.getMessage());
+                        }
+                    }
                     if (failed.get())
                         break;
                 }
@@ -1542,7 +1554,8 @@ public class DirectorySync {
     }
 
     /** Runs copies, which are already recorded as started, and records them as done, or as given up on once someone
-     *  else has changed their source or target, which the next sync sees as a change
+     *  else has changed their source or target, which the next sync sees as a change, or once the target can't hold
+     *  the name, which the pass skips: left recorded, the copy would be resumed, and fail, at the start of every pass
      */
     private static Optional<LocalDateTime> copy(SyncFilesystem srcFs,
                                                 SyncFilesystem targetFs,
@@ -1555,7 +1568,7 @@ public class DirectorySync {
             Optional<LocalDateTime> res = targetFs.copy(srcFs, ops, resuming, syncDb, isCancelled, progress);
             syncDb.finishCopies(ops);
             return res;
-        } catch (ConcurrentChangeException e) {
+        } catch (ConcurrentChangeException | UnrepresentableNameException e) {
             for (CopyOp op : ops)
                 targetFs.discardCopy(op);
             syncDb.finishCopies(ops);
