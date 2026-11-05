@@ -6,6 +6,7 @@ import peergos.shared.mutable.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.*;
+import java.util.stream.*;
 
 public class MutableEventPropagator implements MutablePointers {
 
@@ -44,12 +45,13 @@ public class MutableEventPropagator implements MutablePointers {
         return target.setPointers(owner, updates)
                 .thenApply(res -> {
                     if (res) {
-                        for (SignedPointerUpdate u : updates) {
-                            MutableEvent event = new MutableEvent(owner, u.writer, u.signed);
-                            for (Consumer<? super MutableEvent> listener : listeners) {
+                        // each listener has all of the commit's pointers before the next listener has any
+                        List<MutableEvent> events = updates.stream()
+                                .map(up -> new MutableEvent(owner, up.writer, up.signed))
+                                .collect(Collectors.toList());
+                        for (Consumer<? super MutableEvent> listener : listeners)
+                            for (MutableEvent event : events)
                                 listener.accept(event);
-                            }
-                        }
                     }
                     return res;
                 });
