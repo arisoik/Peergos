@@ -905,6 +905,73 @@ public class WriterQuotaTests {
         assertCannotCommit(child, ownerKey, "a key a refused commit named under two parents");
     }
 
+    /** A writer a commit is still creating is provisional on every server, and on this one after a restart: the
+     *  registration is in the store, not only in the memory of the server handling the commit */
+    @Test
+    public void aWriterACommitIsStillCreatingIsProvisionalOnEveryServer() throws Exception {
+        UserContext owner = signUp();
+        UserContext sharee = signUp();
+        PeergosNetworkUtils.friendBetweenGroups(List.of(owner), List.of(sharee));
+        FileWrapper shared = sharee.getByPath(sharedDir(owner, "team", sharee)).join().get();
+        PublicKeyHash ownerKey = shared.owner();
+        SigningPrivateKeyAndPublicHash parent = shared.signingPair();
+        SigningPrivateKeyAndPublicHash child = newKeyUnder(ownerKey, parent);
+
+        BulkCommitStorage.Registration creating = quotaFilter().registerNewWriter(ownerKey, parent.publicKeyHash, child.publicKeyHash, Optional.empty());
+        SignedPointerUpdate another = new SignedPointerUpdate(child.publicKeyHash, child.secret.signMessage(new byte[] {1}).join());
+        Assert.assertFalse("another server let in a pointer of a writer a commit is still creating",
+                anotherServer().isOwnedWriter(ownerKey, another));
+        creating.undo();
+    }
+
+    /** A registration nothing resolved, as the server handling its commit restarted before the commit landed or was
+     *  refused, is taken back once it expires by whichever server finds it: its writer and edge would otherwise stay
+     *  for good, the queue only dropping children a parent's earlier root named */
+    @Test
+    public void aRegistrationNothingResolvedIsTakenBackOnceItExpires() throws Exception {
+        UserContext owner = signUp();
+        UserContext sharee = signUp();
+        PeergosNetworkUtils.friendBetweenGroups(List.of(owner), List.of(sharee));
+        FileWrapper shared = sharee.getByPath(sharedDir(owner, "team", sharee)).join().get();
+        PublicKeyHash ownerKey = shared.owner();
+        SigningPrivateKeyAndPublicHash parent = shared.signingPair();
+        SigningPrivateKeyAndPublicHash child = newKeyUnder(ownerKey, parent);
+
+        quotaFilter().registerNewWriter(ownerKey, parent.publicKeyHash, child.publicKeyHash, Optional.empty());
+        Assert.assertTrue(usageStore().getOwnedKeys(parent.publicKeyHash).contains(child.publicKeyHash));
+        anotherServer().takeBackExpired(Long.MAX_VALUE);
+        Assert.assertFalse(usageStore().getOwnedKeys(parent.publicKeyHash).contains(child.publicKeyHash));
+        Assert.assertTrue(usageStore().getProvisional(child.publicKeyHash).isEmpty());
+        assertCannotCommit(child, ownerKey, "a key whose creating commit never landed, once its registration expired");
+    }
+
+    /** A commit that landed, its server restarting before the commit's row went, doesn't hold its writer back: the
+     *  writer's next write finds the commit landed, and the row goes */
+    @Test
+    public void aLandedCommitsLeftoverRowDoesntHoldItsWriterBack() throws Exception {
+        UserContext owner = signUp();
+        UserContext sharee = signUp();
+        PeergosNetworkUtils.friendBetweenGroups(List.of(owner), List.of(sharee));
+        FileWrapper shared = sharee.getByPath(sharedDir(owner, "team", sharee)).join().get();
+        PublicKeyHash ownerKey = shared.owner();
+        SigningPrivateKeyAndPublicHash parent = shared.signingPair();
+        SigningPrivateKeyAndPublicHash child = newKeyUnder(ownerKey, parent);
+
+        quotaFilter().registerNewWriter(ownerKey, parent.publicKeyHash, child.publicKeyHash, Optional.empty());
+        // the commit lands, naming the child under its parent
+        linkUnderOwner(ownerKey, child, parent);
+        write(ownerKey, child, 1, KiB);
+        Assert.assertTrue(usageStore().getProvisional(child.publicKeyHash).isEmpty());
+    }
+
+    /** A quota filter over the server's store with nothing in memory: another server's, or this one's after a restart */
+    private static SpaceCheckingKeyFilter anotherServer() throws Exception {
+        return new SpaceCheckingKeyFilter((peergos.shared.corenode.CoreNode) filterField("core"),
+                (MutablePointers) filterField("mutable"), (DeletableContentAddressedStorage) filterField("dht"),
+                (Hasher) filterField("hasher"), (QuotaAdmin) filterField("quotaAdmin"), (UsageStore) filterField("usageStore"),
+                (Long) filterField("quotaUploadLimitSeconds"));
+    }
+
     @Test
     public void anEdgeFromAnotherUsersWriterDoesntKeepARevokedKey() throws Exception {
         UserContext owner = signUp();
