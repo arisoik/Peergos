@@ -234,17 +234,23 @@ public class SpaceCheckingKeyFilter implements SpaceUsage {
         }
     }
 
-    public void accept(MutableEvent event) {
-        // The pointer has moved by now, so a full queue mustn't fail the commit that moved it. The writer's usage is
-        // behind until its next update; an edge recorded below for a child that update never names goes when the
-        // writer does.
-        if (! mutableQueue.offer(event))
-            LOG.warning("Mutable event queue full, usage of writer " + event.writer + " waits for its next update");
+    /** Records what a landed pointer names, ahead of the queue: the children it links, so their first writes count
+     *  under its caps. Each pointer of a commit is recorded before any of its updates is queued (queueLanded), or the
+     *  queue could judge one update before a child the commit moves under another of its writers is linked there, and
+     *  forget the child, its cap with it. */
+    public void recordLanded(MutableEvent event) {
         try {
             prepareMutablePointerChange(event, dht, usageStore, hasher);
         } catch (Exception e) {
             LOG.log(Level.WARNING, "Error registering owned keys for writer " + event.writer + ": " + e.getMessage(), e);
         }
+    }
+
+    /** Queues a landed pointer's usage update. The pointer has moved by now, so a full queue mustn't fail the commit
+     *  that moved it: the writer's usage is behind until its next update. */
+    public void queueLanded(MutableEvent event) {
+        if (! mutableQueue.offer(event))
+            LOG.warning("Mutable event queue full, usage of writer " + event.writer + " waits for its next update");
     }
 
     public static void processCorenodeEvent(String username,

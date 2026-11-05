@@ -994,7 +994,9 @@ public class Main extends Builder {
             CorenodeEventPropagator corePropagator = new CorenodeEventPropagator(signupFilter);
             corePropagator.addListener(spaceChecker::accept);
             MutableEventPropagator localMutable = new MutableEventPropagator(localPointers);
-            localMutable.addListener(spaceChecker::accept);
+            // every pointer a commit lands is recorded before any is queued: the propagator gives each listener all of them
+            localMutable.addListener(spaceChecker::recordLanded);
+            localMutable.addListener(spaceChecker::queueLanded);
 
             Path blacklistPath = a.fromPeergosDir("blacklist_file", "blacklist.txt");
             PublicKeyBlackList blacklist = new UserBasedBlacklist(blacklistPath, core, localMutable, localStorage, hasher);
