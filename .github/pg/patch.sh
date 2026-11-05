@@ -14,7 +14,7 @@ for c in JdbcUsageStoreTests CapUsageCacheTests; do
     sed -i \
         -e 's/new Sqlite\.UncloseableConnection(Sqlite\.build(":memory:"))/PgTestDb.fresh()/' \
         -e 's/new JdbcUsageStore(() -> db, new SqliteCommands())/new JdbcUsageStore(PgTestDb.pool(), new PostgresCommands())/' \
-        -e 's/new JdbcUsageStore(() -> pausing, new SqliteCommands())/new JdbcUsageStore(() -> pausing, new PostgresCommands())/' \
+        -e 's/new JdbcUsageStore(() -> \([a-z]*\), new SqliteCommands())/new JdbcUsageStore(() -> \1, new PostgresCommands())/' \
         "$f"
     if grep -q -E 'Sqlite\.build|SqliteCommands' "$f"; then
         echo "NOT PATCHED: $c still uses SQLite:"; grep -n -E 'Sqlite\.build|SqliteCommands' "$f"; exit 1
