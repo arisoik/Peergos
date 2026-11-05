@@ -16,6 +16,32 @@ import java.util.*;
 
 public class JdbcUsageStoreTests {
 
+    /** A provisional row is kept by key, so it can be in ahead of its writer: one per writer and parent, found once it
+     *  expires, and gone with its writer */
+    @Test
+    public void provisionalWriters() throws Exception {
+        Crypto crypto = Main.initCrypto();
+        Connection db = new Sqlite.UncloseableConnection(Sqlite.build(":memory:"));
+        JdbcUsageStore store = new JdbcUsageStore(() -> db, new SqliteCommands());
+        PublicKeyHash writer = randomKey(crypto), parent = randomKey(crypto), owner = randomKey(crypto);
+        Assert.assertTrue(store.addProvisional(new WriterUsageStore.ProvisionalWriter(writer, parent, owner, true,
+                Optional.of(new byte[] {1}), 1_000)));
+        Assert.assertFalse("a second row for the same writer and parent",
+                store.addProvisional(new WriterUsageStore.ProvisionalWriter(writer, parent, owner, false, Optional.empty(), 2_000)));
+        List<WriterUsageStore.ProvisionalWriter> rows = store.getProvisional(writer);
+        Assert.assertEquals(1, rows.size());
+        Assert.assertTrue(rows.get(0).newWriter());
+        Assert.assertArrayEquals(new byte[] {1}, rows.get(0).signed().get());
+        Assert.assertEquals(List.of(parent, owner), List.of(rows.get(0).parent(), rows.get(0).owner()));
+        Assert.assertTrue(store.getExpiredProvisional(999).isEmpty());
+        Assert.assertEquals(1, store.getExpiredProvisional(1_000).size());
+
+        store.addUserIfAbsent("alice");
+        store.addWriter("alice", writer);
+        store.removeWriter(writer);
+        Assert.assertTrue(store.getProvisional(writer).isEmpty());
+    }
+
     @Test
     public void ownedKeys() throws Exception {
         Crypto crypto = Main.initCrypto();
