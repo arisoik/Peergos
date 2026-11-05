@@ -1,0 +1,67 @@
+name: Postgres tests
+
+on: [push]
+
+jobs:
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        tree: [pr, master-base]
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: peergostest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U testuser -d peergostest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: harness
+    - uses: actions/checkout@v4
+      with:
+        path: tree
+        ref: ${{ matrix.tree == 'pr' && github.sha || '5e6e9460ee0083a1b3f858b204a33cb26f7a5d5c' }}
+    - name: Set up JDK
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 25
+    - name: Point the usage store tests at Postgres
+      working-directory: tree
+      run: bash ../harness/.github/pg/patch.sh
+    - name: Build
+      working-directory: tree
+      run: ant -noinput -buildfile build.xml dist
+    - name: Run tests on Postgres
+      working-directory: tree
+      shell: bash
+      run: |
+        docker exec ${{ job.services.postgres.id }} psql -U testuser -d postgres -t -c "SELECT version()"
+        mkdir -p test.reports
+        mapfile -t classes < pg-classes.txt
+        for c in "${classes[@]}"; do
+          docker exec ${{ job.services.postgres.id }} psql -U testuser -d postgres -q \
+            -c "DROP DATABASE IF EXISTS peergostest WITH (FORCE)" -c "CREATE DATABASE peergostest"
+          echo "::group::$c"
+          ant -noinput -buildfile build.xml execute.test "-Dtest.source.absolute=$PWD/src/peergos/server/tests/$c.java" < /dev/null || true
+          echo "::endgroup::"
+        done
+        python3 ../harness/.github/pg/summary.py pg-classes.txt test.reports
+    - name: Upload test reports
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: postgres-reports-${{ matrix.tree }}
+        path: tree/test.reports/**
+        if-no-files-found: ignore
