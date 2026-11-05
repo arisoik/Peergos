@@ -56,6 +56,8 @@ jobs:
           echo "::group::$c"
           ant -noinput -buildfile build.xml execute.test "-Dtest.source.absolute=$PWD/src/peergos/server/tests/$c.java" < /dev/null || true
           echo "::endgroup::"
+          docker exec ${{ job.services.postgres.id }} psql -U testuser -d peergostest -t -A -c \
+            "SELECT 'in Postgres after $c: users=' || (SELECT count(*) FROM users) || ', writers=' || (SELECT count(*) FROM writers) || ', ownedkeys=' || (SELECT count(*) FROM ownedkeys)" || true
         done
         python3 ../harness/.github/pg/summary.py pg-classes.txt test.reports
     - name: Upload test reports
