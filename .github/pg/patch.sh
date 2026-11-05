@@ -7,6 +7,15 @@ T=src/peergos/server/tests
 cp "$here/PgTestDb.java" "$T/PgTestDb.java"
 : > pg-classes.txt
 
+# without IPFS, Main gives the transaction, bat and partition stores SQLite commands even on a Postgres
+# connection, and Postgres refuses SQLite's "ADD COLUMN time" at start-up: use the configured dialect
+M=src/peergos/server/Main.java
+sed -i \
+    -e 's/JdbcTransactionStore\.build(getDBConnector(args, "transactions-sql-file"), new SqliteCommands())/JdbcTransactionStore.build(getDBConnector(args, "transactions-sql-file"), getSqlCommands(args))/' \
+    -e 's/SqliteCommands sqlCommands = new SqliteCommands();/SqlSupplier sqlCommands = getSqlCommands(args);/' \
+    "$M"
+if grep -n 'new SqliteCommands()' "$M"; then echo "NOT PATCHED: Main still hard-codes SQLite"; exit 1; fi
+
 # store tests: an empty schema per test and the server's pool, instead of an in-memory SQLite
 for c in JdbcUsageStoreTests CapUsageCacheTests; do
     f="$T/$c.java"
